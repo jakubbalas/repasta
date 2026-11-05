@@ -1,6 +1,8 @@
 #[cfg(target_os = "macos")]
 mod appearance;
 #[cfg(target_os = "macos")]
+mod hotkey;
+#[cfg(target_os = "macos")]
 mod keychain;
 #[cfg(target_os = "linux")]
 mod linux;
@@ -91,6 +93,12 @@ enum Message {
     DraftEncrypted(bool),
     /// Applies and saves the panel appearance at once.
     SetAppearance(settings::Appearance),
+    /// Registers and saves the global shortcut at once.
+    #[cfg(target_os = "macos")]
+    SetShortcut(settings::Shortcut),
+    /// The global shortcut was pressed.
+    #[cfg(target_os = "macos")]
+    ShortcutPressed,
     #[cfg(target_os = "macos")]
     ChooseFolder,
     ApplyStorage,
@@ -160,6 +168,11 @@ struct Palette {
     #[cfg(target_os = "macos")]
     menu_bar: Option<menu_bar::MenuBar>,
     #[cfg(target_os = "macos")]
+    shortcut: settings::Shortcut,
+    /// The registered global shortcut; dropping it unregisters.
+    #[cfg(target_os = "macos")]
+    hotkey: Option<hotkey::HotKey>,
+    #[cfg(target_os = "macos")]
     recording: bool,
     #[cfg(target_os = "linux")]
     reading: bool,
@@ -173,6 +186,8 @@ impl Palette {
             mode: iced::theme::Mode::Dark,
             storage: settings::load(),
             appearance: settings::load_appearance(),
+            #[cfg(target_os = "macos")]
+            shortcut: settings::load_shortcut(),
             ..Self::default()
         };
         palette.refresh_colors(true);
@@ -413,6 +428,37 @@ impl Palette {
                         "Menu bar unavailable. Closing the window quits.",
                     );
                 }
+                self.register_shortcut();
+            }
+            #[cfg(target_os = "macos")]
+            Message::SetShortcut(shortcut) => {
+                self.shortcut = shortcut;
+                settings::save_shortcut(shortcut);
+                if self.register_shortcut() {
+                    self.say(
+                        Tone::Neutral,
+                        match shortcut {
+                            settings::Shortcut::Off => "Global shortcut off.".to_owned(),
+                            shortcut => {
+                                format!("Press {} anywhere to show Repasta.", shortcut.label())
+                            }
+                        },
+                    );
+                }
+            }
+            #[cfg(target_os = "macos")]
+            Message::ShortcutPressed => {
+                let Some(menu_bar) = &self.menu_bar else {
+                    return Task::none();
+                };
+                if menu_bar.toggle_app() {
+                    // Open fresh, ready to type, like a launcher.
+                    self.settings_open = false;
+                    self.confirm_clear = false;
+                    self.query.clear();
+                    self.reset_selection();
+                    return iced::widget::operation::focus(SEARCH_ID);
+                }
             }
             Message::Hide => {
                 #[cfg(target_os = "macos")]
@@ -602,6 +648,24 @@ impl Palette {
     }
 
     /// Puts a clip on the system clipboard. Holding Shift drops formatting.
+    /// Registers the chosen global shortcut in place of the current one.
+    /// Returns whether it worked; failures are reported in the status line.
+    #[cfg(target_os = "macos")]
+    fn register_shortcut(&mut self) -> bool {
+        // Unregister first so re-registering the same shortcut succeeds.
+        self.hotkey = None;
+        match hotkey::HotKey::register(self.shortcut) {
+            Ok(hotkey) => {
+                self.hotkey = hotkey;
+                true
+            }
+            Err(error) => {
+                self.say(Tone::Warn, format!("{} {error}", self.shortcut.label()));
+                false
+            }
+        }
+    }
+
     fn delete(&mut self, index: usize) -> Task<Message> {
         if self.history.remove_match(&self.query, index).is_none() {
             return Task::none();
@@ -704,6 +768,8 @@ impl Palette {
             iced::system::theme_changes().map(Message::SystemTheme),
             #[cfg(target_os = "macos")]
             Subscription::run(appearance::changes).map(|()| Message::AppearanceChanged),
+            #[cfg(target_os = "macos")]
+            Subscription::run(hotkey::presses).map(|()| Message::ShortcutPressed),
         ]);
         #[cfg(target_os = "macos")]
         if self.recording {
@@ -845,8 +911,50 @@ impl Palette {
             },
         );
 
+        #[cfg(target_os = "macos")]
+        let shortcut: Element<'_, Message> = {
+            let pills = settings::Shortcut::ALL.into_iter().fold(
+                row![
+                    text("Shortcut").size(15).font(BOLD),
+                    Space::new().width(Fill)
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+                |row, choice| {
+                    row.push(
+                        button(text(choice.label()).size(12).font(BOLD))
+                            .padding([5, 12])
+                            .style(style::pill(self.colors, choice == self.shortcut))
+                            .on_press(Message::SetShortcut(choice)),
+                    )
+                },
+            );
+            let note = match self.shortcut {
+                settings::Shortcut::Off => "Use the menu bar icon to show Repasta.",
+                settings::Shortcut::ShiftCommandV => {
+                    "Shows or hides Repasta from any app. Some apps use ⇧⌘V to paste without formatting; Repasta takes it while running."
+                }
+                settings::Shortcut::ControlCommandV => {
+                    "Shows or hides Repasta from any app. Rarely used by other apps."
+                }
+            };
+            column![pills, text(note).size(12).color(self.colors.muted)]
+                .spacing(6)
+                .into()
+        };
+        #[cfg(target_os = "linux")]
+        let shortcut: Element<'_, Message> = column![
+            text("Shortcut").size(15).font(BOLD),
+            text("Global shortcuts are not available on Linux yet.")
+                .size(12)
+                .color(self.colors.muted),
+        ]
+        .spacing(6)
+        .into();
+
         let mut content = column![
             appearance,
+            shortcut,
             Space::new().height(6),
             text("History storage").size(15).font(BOLD),
             choice(

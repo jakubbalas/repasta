@@ -164,6 +164,12 @@ impl MenuBar {
     pub fn hide_app(&self) {
         NSApplication::sharedApplication(self.mtm).hide(None);
     }
+
+    /// Shows the panel, or hides it when it is already in front. Returns
+    /// whether the panel is now shown.
+    pub fn toggle_app(&self) -> bool {
+        toggle_app(self.mtm)
+    }
 }
 
 fn menu_item(
@@ -199,11 +205,13 @@ fn panel_in_front(mtm: MainThreadMarker) -> bool {
         })
 }
 
-fn toggle_app(mtm: MainThreadMarker) {
+fn toggle_app(mtm: MainThreadMarker) -> bool {
     if panel_in_front(mtm) {
         NSApplication::sharedApplication(mtm).hide(None);
+        false
     } else {
         show_app(mtm);
+        true
     }
 }
 

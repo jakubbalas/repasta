@@ -50,11 +50,15 @@ state, data lifetime, and platform limitations visible.
 - **macOS.** Prototype AppKit general pasteboard capture with polling gated by
   `NSPasteboard.changeCount`. Measure polling latency and idle wakeups.
   Treat clipboard restore, shortcuts, and direct insertion as separate
-  capabilities. [AppKit change count](https://developer.apple.com/documentation/appkit/nspasteboard/changecount)
+  capabilities. The global shortcut (⇧⌘V by default, ⌃⌘V, or off) is a
+  Carbon `RegisterEventHotKey` registration, which needs no Accessibility or
+  Input Monitoring permission and reports only its own key. Direct insertion
+  would need Accessibility and stays a separate, opt-in step. [AppKit change count](https://developer.apple.com/documentation/appkit/nspasteboard/changecount)
 - **Linux Wayland.** Probe the compositor for a supported data-control
   protocol. Provide a focused manual capture workflow when background capture
   is unavailable. Verify keyboard shortcut support separately and document
-  behavior by compositor. [Wayland protocol definition](https://gitlab.freedesktop.org/wayland/wayland-protocols/-/blob/main/staging/ext-data-control/ext-data-control-v1.xml)
+  behavior by compositor; the GlobalShortcuts desktop portal is the candidate.
+  The panel reports that global shortcuts are unavailable on Linux for now. [Wayland protocol definition](https://gitlab.freedesktop.org/wayland/wayland-protocols/-/blob/main/staging/ext-data-control/ext-data-control-v1.xml)
 - **Linux X11.** Watch ownership of the `CLIPBOARD` selection and implement
   bounded, time-limited transfers. Treat source attribution as best effort.
   [X.Org selection documentation](https://www.x.org/releases/X11R7.6/doc/libX11/specs/libX11/libX11.html)

@@ -1,5 +1,5 @@
-//! Remembers the panel's preferences: where history lives and its
-//! appearance. macOS keeps them in the app's user defaults; Linux keeps them
+//! Remembers the panel's preferences: where history lives, its appearance,
+//! and its global shortcut. macOS keeps them in the app's user defaults; Linux keeps them
 //! in `$XDG_CONFIG_HOME/repasta/settings`.
 
 use std::path::PathBuf;
@@ -59,12 +59,52 @@ impl Appearance {
     }
 }
 
+/// The global shortcut that shows or hides the panel.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Shortcut {
+    Off,
+    /// ⇧⌘V. Some apps use it to paste without formatting.
+    #[default]
+    ShiftCommandV,
+    /// ⌃⌘V. Rarely used by other apps.
+    ControlCommandV,
+}
+
+#[cfg(target_os = "macos")]
+impl Shortcut {
+    pub const ALL: [Self; 3] = [Self::ShiftCommandV, Self::ControlCommandV, Self::Off];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::ShiftCommandV => "⇧⌘V",
+            Self::ControlCommandV => "⌃⌘V",
+        }
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::ShiftCommandV => "shift-command-v",
+            Self::ControlCommandV => "control-command-v",
+        }
+    }
+
+    fn from_key(key: &str) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|shortcut| shortcut.key() == key)
+            .unwrap_or_default()
+    }
+}
+
 /// Whether this platform has a key storage adapter.
 pub const ENCRYPTION_AVAILABLE: bool = cfg!(target_os = "macos");
 
 #[cfg(target_os = "macos")]
 mod platform {
-    use super::{Appearance, Storage};
+    use super::{Appearance, Shortcut, Storage};
     use objc2::MainThreadMarker;
     use objc2_app_kit::{NSModalPanelWindowLevel, NSModalResponseOK, NSOpenPanel};
     use objc2_foundation::{NSString, NSURL, NSUserDefaults};
@@ -73,6 +113,25 @@ mod platform {
     const FOLDER: &str = "StorageFolder";
     const ENCRYPTED: &str = "StorageEncrypted";
     const APPEARANCE: &str = "Appearance";
+    const SHORTCUT: &str = "Shortcut";
+
+    pub fn load_shortcut() -> Shortcut {
+        NSUserDefaults::standardUserDefaults()
+            .stringForKey(&NSString::from_str(SHORTCUT))
+            .map(|key| Shortcut::from_key(&key.to_string()))
+            .unwrap_or_default()
+    }
+
+    pub fn save_shortcut(shortcut: Shortcut) {
+        let defaults = NSUserDefaults::standardUserDefaults();
+        // SAFETY: An NSString is a valid property list value.
+        unsafe {
+            defaults.setObject_forKey(
+                Some(&NSString::from_str(shortcut.key())),
+                &NSString::from_str(SHORTCUT),
+            );
+        }
+    }
 
     pub fn load_appearance() -> Appearance {
         NSUserDefaults::standardUserDefaults()
