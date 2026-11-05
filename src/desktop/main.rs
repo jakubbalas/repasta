@@ -4,12 +4,14 @@ mod appearance;
 mod keychain;
 #[cfg(target_os = "linux")]
 mod linux;
+mod looks;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "macos")]
 mod menu_bar;
 mod settings;
 mod style;
+mod thumbnail;
 
 use iced::keyboard::{Event as KeyEvent, Key, Modifiers, key::Named};
 use iced::mouse::ScrollDelta;
@@ -20,8 +22,9 @@ use iced::{
     Alignment, Element, Event, Fill, Font, Point, Size, Subscription, Task, event, font, window,
 };
 use repasta::store::{FolderStore, Sealer, Store, StoreError};
-use repasta::{Capture, History, MAX_CLIP_BYTES};
+use repasta::{Capture, Clip, History, MAX_CLIP_BYTES};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError};
 
 const SEARCH_ID: &str = "clip-search";
 const WINDOW_SIZE: Size = Size::new(400.0, 660.0);
@@ -33,6 +36,8 @@ const PREVIEW_LINES: usize = 2;
 const PREVIEW_CHARS: usize = 46;
 /// Trackpad pixels per selection step when scrolling the list.
 const SCROLL_STEP: f32 = 36.0;
+/// Side of a color clip's swatch.
+const SWATCH: f32 = 34.0;
 
 const BOLD: Font = Font {
     weight: font::Weight::Semibold,
@@ -43,7 +48,7 @@ const BOLD: Font = Font {
 enum Message {
     Capture,
     #[cfg(target_os = "linux")]
-    Captured(Result<String, &'static str>),
+    Captured(Result<Clip, &'static str>),
     #[cfg(target_os = "macos")]
     ToggleRecording,
     #[cfg(target_os = "macos")]
@@ -84,7 +89,18 @@ enum Message {
     #[cfg(target_os = "macos")]
     ChooseFolder,
     ApplyStorage,
+    /// A background save finished.
+    Saved(Result<(), StoreError>),
+    /// Shift selects plain-text restore.
+    Modifiers(Modifiers),
+    /// Makes thumbnails for loaded images, a few at a time.
+    #[cfg(target_os = "macos")]
+    MakeThumbnails,
 }
+
+/// Image thumbnails made per update, keeping the panel responsive.
+#[cfg(target_os = "macos")]
+const THUMBNAILS_PER_UPDATE: usize = 2;
 
 /// Unapplied changes in the settings view.
 #[derive(Default)]
@@ -117,8 +133,14 @@ struct Palette {
     /// Where history lives, as chosen in settings.
     storage: settings::Storage,
     /// The open folder store; `None` for session-only history or when the
-    /// chosen folder is unavailable.
-    store: Option<FolderStore>,
+    /// chosen folder is unavailable. Saves run on a background thread.
+    store: Option<Arc<Mutex<FolderStore>>>,
+    store_encrypted: bool,
+    /// A background save is running.
+    saving: bool,
+    /// History changed while saving; save again when it finishes.
+    save_again: bool,
+    modifiers: Modifiers,
     settings_open: bool,
     draft: Draft,
     appearance: settings::Appearance,
@@ -151,6 +173,8 @@ impl Palette {
         (
             palette,
             Task::batch([
+                #[cfg(target_os = "macos")]
+                Task::done(Message::MakeThumbnails),
                 iced::widget::operation::focus(SEARCH_ID),
                 // iced reads the mode from the window, whose appearance follows
                 // our theme on macOS, so only Linux asks iced.
@@ -205,11 +229,12 @@ impl Palette {
         };
         let result = open_store(&folder, self.storage.encrypted).and_then(|mut store| {
             let saved = store.load()?;
-            self.history.extend_older(saved.iter().map(String::as_str));
+            let count = saved.len();
+            self.history.extend_older(saved);
             if save || store.has_other_form() {
                 store.save(&self.history)?;
             }
-            Ok((store, saved.len()))
+            Ok((store, count))
         });
         match result {
             Ok((store, count)) => {
@@ -219,7 +244,8 @@ impl Palette {
                 } else {
                     "readable"
                 };
-                self.store = Some(store);
+                self.store_encrypted = store.encrypted();
+                self.store = Some(Arc::new(Mutex::new(store)));
                 self.reset_selection();
                 self.say(
                     Tone::Good,
@@ -237,18 +263,23 @@ impl Palette {
         }
     }
 
-    /// Saves history after a change. On failure, keeps the session going and
-    /// stops writing until storage is applied again.
-    fn persist(&mut self) {
-        if let Some(store) = &mut self.store
-            && let Err(error) = store.save(&self.history)
-        {
-            self.store = None;
-            self.say(
-                Tone::Warn,
-                format!("{error} Saving is off until you apply storage again."),
-            );
+    /// Saves a snapshot of history on a background thread. Changes made
+    /// while a save runs are saved once it finishes.
+    fn persist(&mut self) -> Task<Message> {
+        let Some(store) = self.store.clone() else {
+            return Task::none();
+        };
+        if self.saving {
+            self.save_again = true;
+            return Task::none();
         }
+        self.saving = true;
+        // Cheap: image and formatted data are shared, not copied.
+        let snapshot = self.history.clone();
+        Task::perform(
+            run_in_background(move || lock(&store).save(&snapshot)),
+            Message::Saved,
+        )
     }
 
     fn open_settings(&mut self) {
@@ -275,17 +306,41 @@ impl Palette {
         self.history.search(&self.query).count()
     }
 
-    fn accept(&mut self, result: Result<String, &'static str>) {
-        match result.map(|clip| self.history.capture(&clip)) {
-            Ok(Capture::Added | Capture::Refreshed) => {
-                self.reset_selection();
-                self.say(Tone::Good, "Text captured.");
-                self.persist();
+    fn accept(&mut self, result: Result<Clip, &'static str>) -> Task<Message> {
+        let clip = match result {
+            Ok(clip) => clip,
+            Err(status) => {
+                self.say(Tone::Warn, status);
+                return Task::none();
             }
-            Ok(Capture::Empty) => self.say(Tone::Warn, "Clipboard text is empty."),
-            Ok(Capture::TooLarge) => self.say(Tone::Warn, "Clipboard text exceeds 64 KiB."),
-            Err(status) => self.say(Tone::Warn, status),
+        };
+        let (captured, empty, too_large) = match &clip {
+            Clip::Text(text) if text.rtf.is_some() || text.html.is_some() => (
+                "Formatted text captured.",
+                "Clipboard text is empty.",
+                "Clipboard text exceeds 64 KiB.",
+            ),
+            Clip::Text(_) => (
+                "Text captured.",
+                "Clipboard text is empty.",
+                "Clipboard text exceeds 64 KiB.",
+            ),
+            Clip::Image(_) => (
+                "Image captured.",
+                "Clipboard image is empty.",
+                "Image exceeds 10 MiB.",
+            ),
+        };
+        match self.history.add(clip) {
+            Capture::Added | Capture::Refreshed => {
+                self.reset_selection();
+                self.say(Tone::Good, captured);
+                return self.persist();
+            }
+            Capture::Empty => self.say(Tone::Warn, empty),
+            Capture::TooLarge => self.say(Tone::Warn, too_large),
         }
+        Task::none()
     }
 
     fn select_previous(&mut self) {
@@ -312,7 +367,7 @@ impl Palette {
             #[cfg(target_os = "macos")]
             Message::Capture => {
                 let result = self.clipboard.read();
-                self.accept(result);
+                return self.accept(result);
             }
             #[cfg(target_os = "linux")]
             Message::Capture => {
@@ -325,7 +380,7 @@ impl Palette {
             #[cfg(target_os = "linux")]
             Message::Captured(result) => {
                 self.reading = false;
-                self.accept(result);
+                return self.accept(result);
             }
             #[cfg(target_os = "macos")]
             Message::ToggleRecording => {
@@ -334,7 +389,7 @@ impl Palette {
                     self.say(Tone::Neutral, "Background capture paused.");
                 } else if self.clipboard.reset_observation() {
                     self.recording = true;
-                    self.say(Tone::Good, "Recording future text copies.");
+                    self.say(Tone::Good, "Recording future copies.");
                 } else {
                     self.say(Tone::Warn, "System clipboard is unavailable.");
                 }
@@ -373,7 +428,7 @@ impl Palette {
                 if self.recording
                     && let Some(result) = self.clipboard.poll()
                 {
-                    self.accept(result);
+                    return self.accept(result);
                 }
             }
             Message::TogglePin => {
@@ -430,9 +485,11 @@ impl Palette {
                 self.history = History::default();
                 self.query.clear();
                 self.reset_selection();
+                self.save_again = false;
                 #[cfg(target_os = "macos")]
                 self.clipboard.reset_observation();
-                match self.store.as_mut().map(|store| store.erase()) {
+                // Waits for a running save, so the erase comes last.
+                match self.store.as_ref().map(|store| lock(store).erase()) {
                     None => self.say(Tone::Neutral, "History cleared."),
                     Some(Ok(())) => {
                         self.say(Tone::Neutral, "History cleared here and in the folder.")
@@ -470,12 +527,17 @@ impl Palette {
                     encrypted: self.draft.encrypted,
                 };
                 let leaving = self
-                    .store
-                    .as_ref()
-                    .filter(|_| storage.folder.is_none())
-                    .map(|store| folder_name(store.folder()));
+                    .storage
+                    .folder
+                    .as_deref()
+                    .filter(|_| self.store.is_some() && storage.folder.is_none())
+                    .map(folder_name);
                 self.storage = storage;
                 settings::save(&self.storage);
+                if let Some(store) = &self.store {
+                    // Let a running save finish before switching.
+                    drop(lock(store));
+                }
                 self.attach_storage(true);
                 if let Some(name) = leaving {
                     self.say(
@@ -484,33 +546,84 @@ impl Palette {
                     );
                 }
                 self.settings_open = false;
+                #[cfg(target_os = "macos")]
+                return Task::done(Message::MakeThumbnails);
+            }
+            Message::Saved(result) => {
+                self.saving = false;
+                if let Err(error) = result {
+                    self.store = None;
+                    self.save_again = false;
+                    self.say(
+                        Tone::Warn,
+                        format!("{error} Saving is off until you apply storage again."),
+                    );
+                } else if std::mem::take(&mut self.save_again) {
+                    return self.persist();
+                }
+            }
+            Message::Modifiers(modifiers) => self.modifiers = modifiers,
+            #[cfg(target_os = "macos")]
+            Message::MakeThumbnails => {
+                let mut made = 0;
+                for image in self
+                    .history
+                    .images_without_thumbnail()
+                    .take(THUMBNAILS_PER_UPDATE)
+                {
+                    // An empty thumbnail marks an image that cannot be previewed.
+                    image.thumbnail = Some(Arc::new(macos::thumbnail(&image.png).unwrap_or(
+                        repasta::Thumbnail {
+                            width: 0,
+                            height: 0,
+                            rgba: Vec::new(),
+                        },
+                    )));
+                    made += 1;
+                }
+                if made == THUMBNAILS_PER_UPDATE {
+                    return Task::done(Message::MakeThumbnails);
+                }
             }
         }
         Task::none()
     }
 
+    /// Puts a clip on the system clipboard. Holding Shift drops formatting.
     fn restore(&mut self, index: usize) -> Task<Message> {
-        let Some(clip) = self
-            .history
-            .search(&self.query)
-            .nth(index)
-            .map(str::to_owned)
-        else {
+        let Some(clip) = self.history.search(&self.query).nth(index).cloned() else {
             return Task::none();
         };
+        let plain = self.modifiers.shift();
         #[cfg(target_os = "macos")]
         {
-            if self.clipboard.write(&clip) {
-                self.say(Tone::Good, "Copied. Paste it anywhere with ⌘V.");
-            } else {
+            let formatted =
+                matches!(&clip, Clip::Text(text) if text.rtf.is_some() || text.html.is_some());
+            if !self.clipboard.write(&clip, plain) {
                 self.say(Tone::Warn, "Clipboard write failed.");
+            } else if formatted && plain {
+                self.say(Tone::Good, "Copied as plain text. Paste it with ⌘V.");
+            } else {
+                self.say(Tone::Good, "Copied. Paste it anywhere with ⌘V.");
             }
             Task::none()
         }
         #[cfg(target_os = "linux")]
         {
-            self.say(Tone::Good, "Clipboard write requested.");
-            iced::clipboard::write(clip)
+            let _ = plain;
+            match clip {
+                Clip::Text(text) => {
+                    self.say(Tone::Good, "Clipboard write requested.");
+                    iced::clipboard::write(text.plain)
+                }
+                Clip::Image(_) => {
+                    self.say(
+                        Tone::Warn,
+                        "Restoring images is not available on Linux yet.",
+                    );
+                    Task::none()
+                }
+            }
         }
     }
 
@@ -531,14 +644,21 @@ impl Palette {
                 key: Key::Character(key),
                 modifiers,
                 ..
-            }) if modifiers == Modifiers::COMMAND => match key.as_str() {
-                digit @ ("1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9") => {
-                    digit.parse::<usize>().ok().map(|n| Message::Restore(n - 1))
+            }) if modifiers == Modifiers::COMMAND
+                || modifiers == Modifiers::COMMAND | Modifiers::SHIFT =>
+            {
+                match key.as_str() {
+                    digit @ ("1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9") => {
+                        digit.parse::<usize>().ok().map(|n| Message::Restore(n - 1))
+                    }
+                    "q" if !modifiers.shift() => Some(Message::Quit),
+                    "w" if !modifiers.shift() => Some(Message::Hide),
+                    _ => None,
                 }
-                "q" => Some(Message::Quit),
-                "w" => Some(Message::Hide),
-                _ => None,
-            },
+            }
+            Event::Keyboard(KeyEvent::ModifiersChanged(modifiers)) => {
+                Some(Message::Modifiers(modifiers))
+            }
             Event::Window(window::Event::Focused) => Some(Message::AppearanceChanged),
             _ => None,
         });
@@ -613,7 +733,8 @@ impl Palette {
             .into();
 
         let place = match &self.store {
-            Some(store) if store.encrypted() => "encrypted folder",
+            // Read a cached flag so drawing never waits on a running save.
+            Some(_) if self.store_encrypted => "encrypted folder",
             Some(_) => "readable folder",
             None if self.storage.folder.is_some() => "not saved",
             None => "this session",
@@ -826,27 +947,19 @@ impl Palette {
             .into()
     }
 
-    fn clip_card<'a>(&self, index: usize, clip: &'a str) -> Element<'a, Message> {
+    fn clip_card<'a>(&self, index: usize, clip: &'a Clip) -> Element<'a, Message> {
         let selected = index == self.selected;
-        let card = Preview::of(clip);
-
-        let mut body = column![].spacing(2);
-        for line in card.lines {
-            body = body.push(
-                text(line)
-                    .font(Font::MONOSPACE)
-                    .size(12)
-                    .wrapping(Wrapping::None),
-            );
-        }
-
-        let mut meta = format!("{} chars", card.chars);
-        if card.total_lines > 1 {
-            meta.push_str(&format!(" · {} lines", card.total_lines));
-        }
-
+        let formatted =
+            matches!(clip, Clip::Text(text) if text.rtf.is_some() || text.html.is_some());
         let hint: Element<'a, Message> = if selected {
-            text("⏎ copy").size(11).color(self.colors.accent).into()
+            text(if formatted {
+                "⏎ copy · ⇧⏎ plain"
+            } else {
+                "⏎ copy"
+            })
+            .size(11)
+            .color(self.colors.accent)
+            .into()
         } else if index < 9 {
             text(format!(
                 "{}{}",
@@ -864,23 +977,98 @@ impl Palette {
             Space::new().into()
         };
 
-        button(
-            column![
-                container(body).width(Fill).clip(true),
-                row![
-                    text(meta).size(11).color(self.colors.faint),
-                    Space::new().width(Fill),
-                    hint
+        let content: Element<'a, Message> = match clip {
+            Clip::Text(clip_text) => {
+                let card = Preview::of(&clip_text.plain);
+                let look = looks::look(&clip_text.plain);
+                let line_color = match look {
+                    looks::Look::Link { .. } => self.colors.accent,
+                    _ => self.colors.text,
+                };
+                let mut body = column![].spacing(2);
+                for line in card.lines {
+                    body = body.push(
+                        text(line)
+                            .font(Font::MONOSPACE)
+                            .size(12)
+                            .color(line_color)
+                            .wrapping(Wrapping::None),
+                    );
+                }
+
+                let mut meta = match &look {
+                    looks::Look::Link { host } => format!("Link · {}", preview_line(host)),
+                    looks::Look::Color(_) => "Color".to_owned(),
+                    looks::Look::Plain => {
+                        let mut meta = format!("{} chars", card.chars);
+                        if card.total_lines > 1 {
+                            meta.push_str(&format!(" · {} lines", card.total_lines));
+                        }
+                        meta
+                    }
+                };
+                if formatted {
+                    meta.insert_str(0, "Formatted · ");
+                }
+
+                let body: Element<'a, Message> = match look {
+                    looks::Look::Color(color) => row![
+                        container(Space::new())
+                            .width(SWATCH)
+                            .height(SWATCH)
+                            .style(style::swatch(self.colors, color)),
+                        container(body).width(Fill).clip(true),
+                    ]
+                    .spacing(10)
+                    .align_y(Alignment::Center)
+                    .into(),
+                    _ => container(body).width(Fill).clip(true).into(),
+                };
+                column![
+                    body,
+                    row![
+                        text(meta).size(11).color(self.colors.faint),
+                        Space::new().width(Fill),
+                        hint
+                    ]
+                    .align_y(Alignment::Center),
                 ]
-                .align_y(Alignment::Center),
+                .spacing(6)
+                .into()
+            }
+            Clip::Image(image) => row![
+                thumbnail::Preview::new(
+                    image.thumbnail.clone(),
+                    Size::new(84.0, 52.0),
+                    self.colors.surface_raised,
+                    self.colors.outline,
+                ),
+                column![
+                    text("Image").size(13).font(BOLD).color(self.colors.text),
+                    text(format!(
+                        "{} × {} · {}",
+                        image.width,
+                        image.height,
+                        human_size(image.png.len())
+                    ))
+                    .size(11)
+                    .color(self.colors.faint),
+                    Space::new().height(Fill),
+                    row![Space::new().width(Fill), hint],
+                ]
+                .spacing(3)
+                .height(52),
             ]
-            .spacing(6),
-        )
-        .width(Fill)
-        .padding([10, 12])
-        .style(style::clip_card(self.colors, selected))
-        .on_press(Message::Restore(index))
-        .into()
+            .spacing(12)
+            .into(),
+        };
+
+        button(content)
+            .width(Fill)
+            .padding([10, 12])
+            .style(style::clip_card(self.colors, selected))
+            .on_press(Message::Restore(index))
+            .into()
     }
 
     fn footer(&self) -> Element<'_, Message> {
@@ -977,6 +1165,36 @@ fn open_store(folder: &Path, encrypted: bool) -> Result<FolderStore, StoreError>
         None
     };
     Ok(FolderStore::new(folder, encrypted, sealer))
+}
+
+/// Runs blocking work on its own thread and resolves with its result.
+async fn run_in_background<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, StoreError> + Send + 'static,
+) -> Result<T, StoreError> {
+    let (sender, receiver) = iced::futures::channel::oneshot::channel();
+    std::thread::Builder::new()
+        .name("repasta-save".into())
+        .spawn(move || {
+            let _ = sender.send(work());
+        })
+        .map_err(|error| StoreError::Io(error.kind()))?;
+    receiver
+        .await
+        .unwrap_or(Err(StoreError::Io(std::io::ErrorKind::Interrupted)))
+}
+
+/// Locks the store, recovering it if a save thread panicked.
+fn lock(store: &Mutex<FolderStore>) -> std::sync::MutexGuard<'_, FolderStore> {
+    store.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A byte count for display, such as "2.3 MB".
+fn human_size(bytes: usize) -> String {
+    match bytes {
+        0..1_000 => format!("{bytes} B"),
+        1_000..1_000_000 => format!("{:.0} KB", bytes as f64 / 1e3),
+        _ => format!("{:.1} MB", bytes as f64 / 1e6),
+    }
 }
 
 /// The folder's own name for status messages.

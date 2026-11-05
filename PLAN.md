@@ -37,6 +37,13 @@ state, data lifetime, and platform limitations visible.
 4. **Rich clipboard.** Preserve safe alternate formats, add the paste queue,
    and measure the impact of media on capture latency and memory. Publish a
    platform capability matrix before describing desktop compatibility.
+   - Done on macOS: formatted text (RTF and HTML kept beside plain text, with
+     plain-text restore), PNG images with drawn previews (TIFF-only copies are
+     converted), and display-only link and color recognition. Images decode
+     through AppKit within a pixel limit; the panel draws previews from a
+     small RGBA grid, so no image decoder or GPU dependency is added.
+   - Pending: Linux images and formatting, file references, and the paste
+     queue.
 
 ## Platform approach
 
@@ -145,6 +152,12 @@ macOS 27.2 with optimized Rust code. It measured 500 no-match searches over
 Saving a full history to a folder took **11.6 ms** readable and **13.8 ms**
 encrypted (mean of 10 saves, including sync and rename); loading it took
 3.2 ms and 3.8 ms. Measured on the same Apple M5 Pro, macOS 27.2, release
-build, APFS internal SSD, with 128 synthetic 64 KiB clips (8 MiB). Saves run on
-the UI thread after each change, so move them off it if larger histories or
-slower disks push this toward a frame budget.
+build, APFS internal SSD, with 128 synthetic 64 KiB clips (8 MiB). Saves now
+run on a background thread with a snapshot that shares image data, so even a
+full 128 MiB image history does not block the panel.
+
+Image previews are drawn as quads, merging runs of similar pixels. A panel
+showing only worst-case previews (random noise, so nothing merges) took about
+30 ms per frame against 16 ms for text clips, measured as the mean of two
+rendered frames including readback on the same machine with a release build.
+Typical screenshots merge into far fewer quads.

@@ -1,13 +1,14 @@
 use iced::futures::channel::oneshot;
-use repasta::MAX_CLIP_BYTES;
+use repasta::{Clip, MAX_CLIP_BYTES};
 use std::io::Read;
 use std::process::{Command, Stdio};
 
-pub async fn capture() -> Result<String, &'static str> {
+/// Reads clipboard text. Images and formatted text are macOS-only for now.
+pub async fn capture() -> Result<Clip, &'static str> {
     let (sender, receiver) = oneshot::channel();
     std::thread::Builder::new()
         .spawn(move || {
-            let _ = sender.send(read());
+            let _ = sender.send(read().map(Clip::text));
         })
         .map_err(|_| "Could not start clipboard capture.")?;
     receiver.await.unwrap_or(Err("Clipboard capture stopped."))

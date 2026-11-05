@@ -10,7 +10,10 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
-use crate::{History, MAX_CLIP_BYTES, MAX_HISTORY_BYTES, MAX_ITEMS};
+use crate::{
+    Clip, History, Image, MAX_CLIP_BYTES, MAX_HISTORY_BYTES, MAX_IMAGE_BYTES,
+    MAX_IMAGE_HISTORY_BYTES, MAX_ITEMS, MAX_RICH_BYTES, Text,
+};
 
 /// File name of a readable history.
 pub const READABLE_FILE: &str = "repasta-history.txt";
@@ -18,10 +21,16 @@ pub const READABLE_FILE: &str = "repasta-history.txt";
 pub const SEALED_FILE: &str = "repasta-history.sealed";
 const TEMPORARY_FILE: &str = ".repasta-history.tmp";
 
-const READABLE_HEADER: &[u8] = b"Repasta history v1\n";
+/// Text clips only, as written by the first storage release.
+const HEADER_V1: &[u8] = b"Repasta history v1\n";
+/// Text with formatted representations, and images.
+const HEADER_V2: &[u8] = b"Repasta history v2\n";
 const SEALED_HEADER: &[u8] = b"Repasta sealed history v1\n";
-/// Room for per-clip length lines and a sealer's nonce and tag.
-const MAX_FILE_BYTES: u64 = (MAX_HISTORY_BYTES + MAX_ITEMS * 8 + 4096) as u64;
+/// Longest entry line, such as `image 4294967295 4294967295 10485760`.
+const MAX_LINE: usize = 64;
+/// Room for entry lines and a sealer's nonce and tag.
+const MAX_FILE_BYTES: u64 =
+    (MAX_HISTORY_BYTES + MAX_IMAGE_HISTORY_BYTES + MAX_ITEMS * (MAX_LINE + 2) + 4096) as u64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoreError {
@@ -57,7 +66,7 @@ impl From<io::Error> for StoreError {
 }
 
 /// Authenticated encryption for saved history.
-pub trait Sealer {
+pub trait Sealer: Send {
     fn seal(&self, plain: &[u8]) -> Result<Vec<u8>, StoreError>;
     /// Fails with [`StoreError::Unreadable`] when authentication fails.
     fn open(&self, sealed: &[u8]) -> Result<Vec<u8>, StoreError>;
@@ -67,7 +76,7 @@ pub trait Sealer {
 /// of errors and logs.
 pub trait Store {
     /// Saved clips, newest first.
-    fn load(&mut self) -> Result<Vec<String>, StoreError>;
+    fn load(&mut self) -> Result<Vec<Clip>, StoreError>;
     /// Replaces the saved history with `history`.
     fn save(&mut self, history: &History) -> Result<(), StoreError>;
     /// Deletes the saved history.
@@ -146,7 +155,7 @@ impl FolderStore {
         Ok(Some(bytes))
     }
 
-    fn decode_file(&self, bytes: &[u8], sealed: bool) -> Result<Vec<String>, StoreError> {
+    fn decode_file(&self, bytes: &[u8], sealed: bool) -> Result<Vec<Clip>, StoreError> {
         if !sealed {
             return decode(bytes);
         }
@@ -161,7 +170,7 @@ impl FolderStore {
 impl Store for FolderStore {
     /// Reads this store's file, and also the other form's file so a folder
     /// can switch between encrypted and readable without losing history.
-    fn load(&mut self) -> Result<Vec<String>, StoreError> {
+    fn load(&mut self) -> Result<Vec<Clip>, StoreError> {
         if !self.folder.is_dir() {
             return Err(StoreError::Io(io::ErrorKind::NotFound));
         }
@@ -223,57 +232,194 @@ fn write_atomically(folder: &Path, path: &Path, bytes: &[u8]) -> Result<(), Stor
     Ok(result?)
 }
 
-/// Serializes `history`, newest first: a header line, then for each clip its
-/// byte length on one line followed by the clip and a newline.
+/// Serializes `history`, newest first. After a header line, each clip is an
+/// entry line with byte lengths followed by the data and a newline:
+///
+/// ```text
+/// text <plain> <rtf> <html>
+/// <plain bytes><rtf bytes><html bytes>
+/// image <width> <height> <png>
+/// <png bytes>
+/// ```
+///
+/// A length of 0 means the representation is absent.
 pub fn encode(history: &History) -> Vec<u8> {
-    let mut bytes = READABLE_HEADER.to_vec();
+    let mut bytes = HEADER_V2.to_vec();
+    let length = |rich: &Option<std::sync::Arc<[u8]>>| rich.as_ref().map_or(0, |rich| rich.len());
     for clip in history.iter() {
-        bytes.extend_from_slice(clip.len().to_string().as_bytes());
-        bytes.push(b'\n');
-        bytes.extend_from_slice(clip.as_bytes());
+        match clip {
+            Clip::Text(text) => {
+                let line = format!(
+                    "text {} {} {}\n",
+                    text.plain.len(),
+                    length(&text.rtf),
+                    length(&text.html)
+                );
+                bytes.extend_from_slice(line.as_bytes());
+                bytes.extend_from_slice(text.plain.as_bytes());
+                for rich in [&text.rtf, &text.html].into_iter().flatten() {
+                    bytes.extend_from_slice(rich);
+                }
+            }
+            Clip::Image(image) => {
+                let line = format!(
+                    "image {} {} {}\n",
+                    image.width,
+                    image.height,
+                    image.png.len()
+                );
+                bytes.extend_from_slice(line.as_bytes());
+                bytes.extend_from_slice(&image.png);
+            }
+        }
         bytes.push(b'\n');
     }
     bytes
 }
 
-/// Parses [`encode`] output within the history limits.
-pub fn decode(bytes: &[u8]) -> Result<Vec<String>, StoreError> {
-    let mut rest = bytes
-        .strip_prefix(READABLE_HEADER)
+/// Parses [`encode`] output, or the text-only first release's format, within
+/// the history limits.
+pub fn decode(bytes: &[u8]) -> Result<Vec<Clip>, StoreError> {
+    if let Some(rest) = bytes.strip_prefix(HEADER_V1) {
+        return Decoder::new(rest).decode_v1();
+    }
+    let rest = bytes
+        .strip_prefix(HEADER_V2)
         .ok_or(StoreError::Unreadable)?;
-    let mut clips = Vec::new();
-    let mut total = 0;
-    while !rest.is_empty() {
-        let newline = rest
+    Decoder::new(rest).decode_v2()
+}
+
+struct Decoder<'a> {
+    rest: &'a [u8],
+    clips: Vec<Clip>,
+    text_bytes: usize,
+    image_bytes: usize,
+}
+
+impl<'a> Decoder<'a> {
+    fn new(rest: &'a [u8]) -> Self {
+        Self {
+            rest,
+            clips: Vec::new(),
+            text_bytes: 0,
+            image_bytes: 0,
+        }
+    }
+
+    /// The next line's space-separated fields, without the newline.
+    fn line(&mut self) -> Result<Vec<&'a str>, StoreError> {
+        let newline = self
+            .rest
             .iter()
-            .take(8)
+            .take(MAX_LINE + 1)
             .position(|&byte| byte == b'\n')
             .ok_or(StoreError::Unreadable)?;
-        let digits = &rest[..newline];
-        if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+        let line =
+            std::str::from_utf8(&self.rest[..newline]).map_err(|_| StoreError::Unreadable)?;
+        self.rest = &self.rest[newline + 1..];
+        Ok(line.split(' ').collect())
+    }
+
+    fn take(&mut self, length: usize) -> Result<&'a [u8], StoreError> {
+        if self.rest.len() < length {
             return Err(StoreError::Unreadable);
         }
-        let length: usize = std::str::from_utf8(digits)
-            .ok()
-            .and_then(|digits| digits.parse().ok())
-            .ok_or(StoreError::Unreadable)?;
-        total += length;
-        if length == 0
-            || length > MAX_CLIP_BYTES
-            || total > MAX_HISTORY_BYTES
-            || clips.len() == MAX_ITEMS
+        let (taken, rest) = self.rest.split_at(length);
+        self.rest = rest;
+        Ok(taken)
+    }
+
+    fn end_entry(&mut self) -> Result<(), StoreError> {
+        match self.rest.split_first() {
+            Some((b'\n', rest)) => {
+                self.rest = rest;
+                Ok(())
+            }
+            _ => Err(StoreError::Unreadable),
+        }
+    }
+
+    fn push(&mut self, clip: Clip) -> Result<(), StoreError> {
+        let (text, image) = clip.cost();
+        self.text_bytes += text;
+        self.image_bytes += image;
+        if self.clips.len() == MAX_ITEMS
+            || self.text_bytes > MAX_HISTORY_BYTES
+            || self.image_bytes > MAX_IMAGE_HISTORY_BYTES
         {
             return Err(StoreError::Unreadable);
         }
-        rest = &rest[newline + 1..];
-        if rest.len() < length + 1 || rest[length] != b'\n' {
+        self.clips.push(clip);
+        Ok(())
+    }
+
+    fn plain(&mut self, length: usize) -> Result<String, StoreError> {
+        if length == 0 || length > MAX_CLIP_BYTES {
             return Err(StoreError::Unreadable);
         }
-        let clip = std::str::from_utf8(&rest[..length]).map_err(|_| StoreError::Unreadable)?;
-        clips.push(clip.to_owned());
-        rest = &rest[length + 1..];
+        let bytes = self.take(length)?;
+        String::from_utf8(bytes.to_vec()).map_err(|_| StoreError::Unreadable)
     }
-    Ok(clips)
+
+    fn rich(&mut self, length: usize) -> Result<Option<std::sync::Arc<[u8]>>, StoreError> {
+        if length > MAX_RICH_BYTES {
+            return Err(StoreError::Unreadable);
+        }
+        (length > 0)
+            .then(|| self.take(length).map(Into::into))
+            .transpose()
+    }
+
+    fn decode_v1(mut self) -> Result<Vec<Clip>, StoreError> {
+        while !self.rest.is_empty() {
+            let [length] = self.line()?[..] else {
+                return Err(StoreError::Unreadable);
+            };
+            let plain = self.plain(number(length)?)?;
+            self.end_entry()?;
+            self.push(Clip::text(plain))?;
+        }
+        Ok(self.clips)
+    }
+
+    fn decode_v2(mut self) -> Result<Vec<Clip>, StoreError> {
+        while !self.rest.is_empty() {
+            let clip = match self.line()?[..] {
+                ["text", plain, rtf, html] => {
+                    let (plain, rtf, html) = (number(plain)?, number(rtf)?, number(html)?);
+                    Clip::Text(Text {
+                        plain: self.plain(plain)?,
+                        rtf: self.rich(rtf)?,
+                        html: self.rich(html)?,
+                    })
+                }
+                ["image", width, height, png] => {
+                    let (width, height, png) = (number(width)?, number(height)?, number(png)?);
+                    if width == 0 || height == 0 || png == 0 || png > MAX_IMAGE_BYTES {
+                        return Err(StoreError::Unreadable);
+                    }
+                    Clip::Image(Image {
+                        width: u32::try_from(width).map_err(|_| StoreError::Unreadable)?,
+                        height: u32::try_from(height).map_err(|_| StoreError::Unreadable)?,
+                        png: self.take(png)?.into(),
+                        thumbnail: None,
+                    })
+                }
+                _ => return Err(StoreError::Unreadable),
+            };
+            self.end_entry()?;
+            self.push(clip)?;
+        }
+        Ok(self.clips)
+    }
+}
+
+/// A decimal length or dimension: ASCII digits only, at most 10 of them.
+fn number(field: &str) -> Result<usize, StoreError> {
+    if field.is_empty() || field.len() > 10 || !field.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(StoreError::Unreadable);
+    }
+    field.parse().map_err(|_| StoreError::Unreadable)
 }
 
 #[cfg(test)]
@@ -308,6 +454,13 @@ mod tests {
         history
     }
 
+    fn plains(clips: Vec<Clip>) -> Vec<String> {
+        clips
+            .iter()
+            .map(|clip| clip.plain().expect("text clip").to_owned())
+            .collect()
+    }
+
     fn folder(name: &str) -> PathBuf {
         let path =
             std::env::temp_dir().join(format!("repasta-store-{name}-{}", std::process::id()));
@@ -320,8 +473,59 @@ mod tests {
     fn readable_format_round_trips_newlines_and_unicode() {
         let clips = ["first\nline\n", "é ✂︎", "12\n"];
         let bytes = encode(&history(&clips));
-        assert!(bytes.starts_with(READABLE_HEADER));
-        assert_eq!(decode(&bytes).unwrap(), clips);
+        assert!(bytes.starts_with(HEADER_V2));
+        assert_eq!(plains(decode(&bytes).unwrap()), clips);
+    }
+
+    #[test]
+    fn format_round_trips_formatted_text_and_images() {
+        let mut history = History::default();
+        history.add(Clip::Image(Image {
+            png: b"\x89PNG\n\x1a\nsynthetic".as_slice().into(),
+            width: 3,
+            height: 2,
+            thumbnail: None,
+        }));
+        history.add(Clip::Text(Text {
+            plain: "bold\nline".into(),
+            rtf: Some(b"{\\rtf1 \\b bold}".as_slice().into()),
+            html: None,
+        }));
+        history.add(Clip::Text(Text {
+            plain: "link".into(),
+            rtf: None,
+            html: Some(b"<a href=x>link</a>".as_slice().into()),
+        }));
+        let decoded = decode(&encode(&history)).unwrap();
+        assert_eq!(decoded, history.iter().cloned().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn first_release_files_still_load() {
+        let v1 = b"Repasta history v1\n4\nbeta\n5\nalpha\n";
+        assert_eq!(plains(decode(v1).unwrap()), ["beta", "alpha"]);
+    }
+
+    #[test]
+    fn decoding_rejects_malformed_entries() {
+        let bad: [&[u8]; 9] = [
+            b"Repasta history v2\ntext 2 0 0\nab",
+            b"Repasta history v2\ntext 0 0 0\n\n",
+            b"Repasta history v2\ntext 2 0\nab\n",
+            b"Repasta history v2\nnote 2 0 0\nab\n",
+            b"Repasta history v2\ntext 2 3 0\nab\n",
+            b"Repasta history v2\nimage 0 1 1\nx\n",
+            b"Repasta history v2\nimage 1 1 0\n\n",
+            b"Repasta history v2\nimage 1 99999999999 1\nx\n",
+            b"Repasta history v2\ntext  2 0 0\nab\n",
+        ];
+        for bytes in bad {
+            assert_eq!(decode(bytes), Err(StoreError::Unreadable), "{bytes:?}");
+        }
+        let rich = format!("Repasta history v2\ntext 1 {} 0\nx", MAX_RICH_BYTES + 1);
+        assert_eq!(decode(rich.as_bytes()), Err(StoreError::Unreadable));
+        let image = format!("Repasta history v2\nimage 1 1 {}\n", MAX_IMAGE_BYTES + 1);
+        assert_eq!(decode(image.as_bytes()), Err(StoreError::Unreadable));
     }
 
     #[test]
@@ -350,20 +554,20 @@ mod tests {
         let mut readable = FolderStore::new(&dir, false, None);
         assert!(readable.load().unwrap().is_empty());
         readable.save(&history(&["beta", "alpha"])).unwrap();
-        assert_eq!(readable.load().unwrap(), ["beta", "alpha"]);
+        assert_eq!(plains(readable.load().unwrap()), ["beta", "alpha"]);
 
         // Switching the folder to encrypted reads the readable file, then
         // replaces it with a sealed one.
         let mut sealed = FolderStore::new(&dir, true, Some(Box::new(Mirror)));
         assert!(sealed.has_other_form());
         let clips = sealed.load().unwrap();
-        assert_eq!(clips, ["beta", "alpha"]);
+        assert_eq!(plains(clips), ["beta", "alpha"]);
         sealed.save(&history(&["beta", "alpha"])).unwrap();
         assert!(!dir.join(READABLE_FILE).exists());
         let raw = fs::read(dir.join(SEALED_FILE)).unwrap();
         assert!(raw.starts_with(SEALED_HEADER));
         assert!(!raw.windows(5).any(|window| window == b"alpha"));
-        assert_eq!(sealed.load().unwrap(), ["beta", "alpha"]);
+        assert_eq!(plains(sealed.load().unwrap()), ["beta", "alpha"]);
 
         // Without the key the sealed file is left alone.
         let mut keyless = FolderStore::new(&dir, false, None);
@@ -376,7 +580,7 @@ mod tests {
 
         // With the key, the folder can switch back to readable.
         let mut readable = FolderStore::new(&dir, false, Some(Box::new(Mirror)));
-        assert_eq!(readable.load().unwrap(), ["beta", "alpha"]);
+        assert_eq!(plains(readable.load().unwrap()), ["beta", "alpha"]);
         readable.save(&history(&["beta", "alpha"])).unwrap();
         assert!(!FolderStore::has_sealed_history(&dir));
         let mut sealed = FolderStore::new(&dir, true, Some(Box::new(Mirror)));

@@ -11,9 +11,10 @@ cargo run --locked --features desktop --bin repasta-desktop
 
 Repasta opens as a compact panel in the top-right corner and stays above other
 windows. Click **Pinned** to let it sit behind other windows instead. Click
-**Capture** to save the current plain-text clip. Type to search, use **↑** and
+**Capture** to save the current clip. Type to search, use **↑** and
 **↓** or scroll to select, and press **Enter**, **⌘1**–**⌘9**, or click a clip
-to put it on the system clipboard. On Linux, use **Ctrl** instead of **⌘**. Then
+to put it on the system clipboard. Hold **Shift** (**⇧⏎**, **⌘⇧1**–**⌘⇧9**,
+or Shift-click) to copy formatted text as plain text. On Linux, use **Ctrl** instead of **⌘**. Then
 paste in the destination app as usual. **Esc** clears the search. **Clear**
 clears Repasta's history, including the saved file when history is saved to a
 folder; the system clipboard is separate.
@@ -42,8 +43,32 @@ On macOS the panel also uses the accent color from **System Settings →
 Appearance** and updates as soon as you change it; with **Multicolor** it
 keeps Repasta's amber.
 
-Each clip is limited to 64 KiB, and history retains at most 512 clips and
-8 MiB of text payload.
+### Rich clips
+
+On macOS, Repasta keeps more than plain text:
+
+- **Formatted text** keeps its RTF and HTML alongside the plain text, so
+  pasting keeps bold, links, and other formatting. Cards show **Formatted**.
+- **Images**, such as screenshots taken with **⌃⌘⇧4** or pictures copied
+  from an app, show a small preview with their size. They are kept as PNG and
+  restored as PNG and TIFF. Type "image" to find them.
+- **Links and colors** in text clips are recognized for display: links show
+  their host, and hex, `rgb()`, and `rgba()` colors show a swatch. They stay
+  plain text, and Repasta never opens or fetches a link.
+
+When a copy holds both text and an image, Repasta keeps the text. Linux
+captures and restores plain text only for now.
+
+Limits:
+
+| Kind | Per clip | History total |
+| --- | --- | --- |
+| Plain text | 64 KiB | 8 MiB, shared with formatting |
+| Formatting (RTF or HTML) | 256 KiB each; larger formatting is dropped and the plain text kept | (see above) |
+| Images (PNG) | 10 MiB, at most 64 megapixels | 128 MiB |
+
+History keeps at most 512 clips. When a budget fills, the oldest clips of
+that kind are dropped first.
 
 ### History storage
 
@@ -57,7 +82,8 @@ Click **⚙** in the panel to choose where history lives, then click **Apply**:
     file is `repasta-history.sealed`, sealed with AES-256-GCM. The key is
     created in your login Keychain the first time and never leaves it, so the
     file cannot be opened on another Mac or account.
-  - With it off, the file is `repasta-history.txt`, a readable text file.
+  - With it off, the file is `repasta-history.txt`, readable in a text
+    editor except for images, which are stored inline as PNG data.
     Anything you copy, including passwords, is stored as plain text. Linux
     offers only readable files for now.
 

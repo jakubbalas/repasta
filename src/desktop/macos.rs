@@ -1,9 +1,17 @@
-use objc2::{ClassType, msg_send, rc::Retained};
-use objc2_app_kit::{NSPasteboard, NSPasteboardTypeString};
-use objc2_foundation::NSString;
-use repasta::MAX_CLIP_BYTES;
+use std::sync::Arc;
 
-type ReadResult = Result<String, &'static str>;
+use objc2::{AnyThread, ClassType, msg_send, rc::Retained};
+use objc2_app_kit::{
+    NSBitmapImageFileType, NSBitmapImageRep, NSDeviceRGBColorSpace, NSGraphicsContext,
+    NSImageInterpolation, NSPasteboard, NSPasteboardTypeHTML, NSPasteboardTypePNG,
+    NSPasteboardTypeRTF, NSPasteboardTypeString, NSPasteboardTypeTIFF,
+};
+use objc2_foundation::{NSData, NSDictionary, NSPoint, NSRect, NSSize, NSString};
+use repasta::{
+    Clip, Image, MAX_CLIP_BYTES, MAX_IMAGE_BYTES, MAX_IMAGE_PIXELS, MAX_RICH_BYTES, Text, Thumbnail,
+};
+
+type ReadResult = Result<Clip, &'static str>;
 
 pub struct Clipboard {
     // Track ownership changes, including writes made by this application.
@@ -62,26 +70,220 @@ impl Clipboard {
             return Err("Clipboard item marked private, transient, or generated.");
         }
 
-        // SAFETY: This exported AppKit constant is an immutable type identifier.
-        let data = board.dataForType(unsafe { NSPasteboardTypeString });
-        let data = data.ok_or("No readable plain text on the clipboard.")?;
-        if data.len() > MAX_CLIP_BYTES {
-            return Err("Clipboard text exceeds 64 KiB.");
+        // Prefer text: apps that copy text often add an image of it too.
+        // SAFETY: These exported AppKit constants are immutable type identifiers.
+        let (string, rtf, html, png, tiff) = unsafe {
+            (
+                NSPasteboardTypeString,
+                NSPasteboardTypeRTF,
+                NSPasteboardTypeHTML,
+                NSPasteboardTypePNG,
+                NSPasteboardTypeTIFF,
+            )
+        };
+        if let Some(data) = board.dataForType(string) {
+            if data.len() > MAX_CLIP_BYTES {
+                return Err("Clipboard text exceeds 64 KiB.");
+            }
+            let plain =
+                String::from_utf8(data.to_vec()).map_err(|_| "Clipboard text is not UTF-8.")?;
+            // Formatted copies over the limit keep only their plain text.
+            let rich = |kind| {
+                board
+                    .dataForType(kind)
+                    .filter(|data| !data.is_empty() && data.len() <= MAX_RICH_BYTES)
+                    .map(|data| Arc::from(data.to_vec()))
+            };
+            return Ok(Clip::Text(Text {
+                plain,
+                rtf: rich(rtf),
+                html: rich(html),
+            }));
         }
-
-        String::from_utf8(data.to_vec()).map_err(|_| "Clipboard text is not UTF-8.")
+        if let Some(data) = board.dataForType(png) {
+            if data.len() > MAX_IMAGE_BYTES {
+                return Err("Image exceeds 10 MiB.");
+            }
+            return image_clip(data.to_vec());
+        }
+        if let Some(data) = board.dataForType(tiff) {
+            if data.len() > MAX_TIFF_BYTES {
+                return Err("Image exceeds 10 MiB.");
+            }
+            let png = to_png(&data).ok_or("Image could not be read.")?;
+            if png.len() > MAX_IMAGE_BYTES {
+                return Err("Image exceeds 10 MiB.");
+            }
+            return image_clip(png);
+        }
+        Err("No text or image on the clipboard.")
     }
 
-    pub fn write(&mut self, clip: &str) -> bool {
-        general_board().is_some_and(|board| self.write_board(&board, clip))
+    /// Puts `clip` on the clipboard. With `plain`, formatted text loses its
+    /// formatting.
+    pub fn write(&mut self, clip: &Clip, plain: bool) -> bool {
+        general_board().is_some_and(|board| self.write_board(&board, clip, plain))
     }
 
-    fn write_board(&mut self, board: &NSPasteboard, clip: &str) -> bool {
-        let text = NSString::from_str(clip);
+    fn write_board(&mut self, board: &NSPasteboard, clip: &Clip, plain: bool) -> bool {
         self.observed = Some(board.clearContents());
-        // SAFETY: This exported AppKit constant is an immutable type identifier.
-        board.setString_forType(&text, unsafe { NSPasteboardTypeString })
+        // SAFETY: These exported AppKit constants are immutable type identifiers.
+        let written = unsafe {
+            match clip {
+                Clip::Text(text) => {
+                    let mut written = board.setString_forType(
+                        &NSString::from_str(&text.plain),
+                        NSPasteboardTypeString,
+                    );
+                    if !plain {
+                        for (rich, kind) in [
+                            (&text.rtf, NSPasteboardTypeRTF),
+                            (&text.html, NSPasteboardTypeHTML),
+                        ] {
+                            if let Some(rich) = rich {
+                                written &=
+                                    board.setData_forType(Some(&NSData::with_bytes(rich)), kind);
+                            }
+                        }
+                    }
+                    written
+                }
+                Clip::Image(image) => {
+                    let png = NSData::with_bytes(&image.png);
+                    // Offer TIFF too for apps that only read it.
+                    let tiff = NSBitmapImageRep::imageRepWithData(&png)
+                        .and_then(|rep| rep.TIFFRepresentation());
+                    let mut written = board.setData_forType(Some(&png), NSPasteboardTypePNG);
+                    if let Some(tiff) = tiff {
+                        written &= board.setData_forType(Some(&tiff), NSPasteboardTypeTIFF);
+                    }
+                    written
+                }
+            }
+        };
+        // Count our own writes as observed so they are not captured again.
+        self.observed = Some(board.changeCount());
+        written
     }
+}
+
+/// TIFF clipboard data is often uncompressed; allow more before converting.
+const MAX_TIFF_BYTES: usize = 64 * 1024 * 1024;
+/// Thumbnails fit in this many cells, matching the card's preview box.
+const THUMBNAIL_CELLS: (f64, f64) = (58.0, 36.0);
+
+fn image_clip(png: Vec<u8>) -> ReadResult {
+    let data = NSData::with_bytes(&png);
+    let rep = NSBitmapImageRep::imageRepWithData(&data).ok_or("Image could not be read.")?;
+    let (width, height) = dimensions(&rep).ok_or("Image is too large to preview.")?;
+    Ok(Clip::Image(Image {
+        png: png.into(),
+        width,
+        height,
+        thumbnail: thumbnail_of(&rep).map(Arc::new),
+    }))
+}
+
+/// Pixel dimensions within [`MAX_IMAGE_PIXELS`].
+fn dimensions(rep: &NSBitmapImageRep) -> Option<(u32, u32)> {
+    let width = u32::try_from(rep.pixelsWide())
+        .ok()
+        .filter(|&width| width > 0)?;
+    let height = u32::try_from(rep.pixelsHigh())
+        .ok()
+        .filter(|&height| height > 0)?;
+    (u64::from(width) * u64::from(height) <= MAX_IMAGE_PIXELS).then_some((width, height))
+}
+
+fn to_png(tiff: &NSData) -> Option<Vec<u8>> {
+    let rep = NSBitmapImageRep::imageRepWithData(tiff)?;
+    dimensions(&rep)?;
+    // SAFETY: An empty dictionary is a valid set of PNG properties.
+    let png = unsafe {
+        rep.representationUsingType_properties(NSBitmapImageFileType::PNG, &NSDictionary::new())
+    }?;
+    Some(png.to_vec())
+}
+
+/// A thumbnail for a saved PNG, made after loading history.
+pub fn thumbnail(png: &[u8]) -> Option<Thumbnail> {
+    let rep = NSBitmapImageRep::imageRepWithData(&NSData::with_bytes(png))?;
+    dimensions(&rep)?;
+    thumbnail_of(&rep)
+}
+
+/// Draws `rep` scaled into a small RGBA bitmap.
+fn thumbnail_of(rep: &NSBitmapImageRep) -> Option<Thumbnail> {
+    let (width, height) = dimensions(rep)?;
+    let scale = (THUMBNAIL_CELLS.0 / f64::from(width))
+        .min(THUMBNAIL_CELLS.1 / f64::from(height))
+        .min(1.0);
+    let cells = |pixels: u32| ((f64::from(pixels) * scale).round() as isize).max(1);
+    let (columns, rows) = (cells(width), cells(height));
+
+    // SAFETY: Null planes ask AppKit to allocate an 8-bit RGBA buffer of the
+    // given size; the color space name is an immutable AppKit constant.
+    let target = unsafe {
+        NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel(
+            NSBitmapImageRep::alloc(),
+            std::ptr::null_mut(),
+            columns,
+            rows,
+            8,
+            4,
+            true,
+            false,
+            NSDeviceRGBColorSpace,
+            columns * 4,
+            32,
+        )
+    }?;
+    let context = NSGraphicsContext::graphicsContextWithBitmapImageRep(&target)?;
+    NSGraphicsContext::saveGraphicsState_class();
+    NSGraphicsContext::setCurrentContext(Some(&context));
+    context.setImageInterpolation(NSImageInterpolation::High);
+    let drawn = rep.drawInRect(NSRect::new(
+        NSPoint::new(0.0, 0.0),
+        NSSize::new(columns as f64, rows as f64),
+    ));
+    context.flushGraphics();
+    NSGraphicsContext::restoreGraphicsState_class();
+    if !drawn {
+        return None;
+    }
+
+    let stride = usize::try_from(target.bytesPerRow()).ok()?;
+    let (columns, rows) = (columns as usize, rows as usize);
+    let pixels = target.bitmapData();
+    if pixels.is_null() || stride < columns * 4 {
+        return None;
+    }
+    // SAFETY: `target` owns a `stride * rows` buffer and outlives this slice.
+    let buffer = unsafe { std::slice::from_raw_parts(pixels, stride * rows) };
+    let mut rgba = Vec::with_capacity(columns * rows * 4);
+    for row in buffer.chunks_exact(stride) {
+        for pixel in row[..columns * 4].chunks_exact(4) {
+            // AppKit premultiplies alpha; undo it for display.
+            let alpha = pixel[3];
+            let channel = |value: u8| match alpha {
+                0 => 0,
+                255 => value,
+                _ => ((u16::from(value) * 255 + u16::from(alpha) / 2) / u16::from(alpha)).min(255)
+                    as u8,
+            };
+            rgba.extend_from_slice(&[
+                channel(pixel[0]),
+                channel(pixel[1]),
+                channel(pixel[2]),
+                alpha,
+            ]);
+        }
+    }
+    Some(Thumbnail {
+        width: columns as u16,
+        height: rows as u16,
+        rgba,
+    })
 }
 
 fn general_board() -> Option<Retained<NSPasteboard>> {
@@ -93,21 +295,58 @@ fn general_board() -> Option<Retained<NSPasteboard>> {
 mod tests {
     use super::*;
 
+    /// A solid 2×1 PNG made by AppKit, so the test has no binary fixture.
+    fn synthetic_png() -> Vec<u8> {
+        let tiff = {
+            let rep = thumbnail_source(2, 1);
+            rep.TIFFRepresentation().expect("TIFF")
+        };
+        to_png(&tiff).expect("PNG")
+    }
+
+    fn thumbnail_source(width: isize, height: isize) -> Retained<NSBitmapImageRep> {
+        // SAFETY: See `thumbnail_of`; AppKit allocates the buffer.
+        let rep = unsafe {
+            NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel(
+                NSBitmapImageRep::alloc(),
+                std::ptr::null_mut(),
+                width,
+                height,
+                8,
+                4,
+                true,
+                false,
+                NSDeviceRGBColorSpace,
+                width * 4,
+                32,
+            )
+        }
+        .expect("bitmap");
+        let pixels = rep.bitmapData();
+        // SAFETY: The buffer holds `width * height` RGBA pixels.
+        let buffer =
+            unsafe { std::slice::from_raw_parts_mut(pixels, (width * height * 4) as usize) };
+        for pixel in buffer.chunks_exact_mut(4) {
+            pixel.copy_from_slice(&[200, 40, 10, 255]);
+        }
+        rep
+    }
+
     #[test]
     #[ignore = "requires access to the macOS pasteboard service"]
     fn appkit_round_trip_checks_ownership_limits_and_sensitive_markers() {
         // Keep the user's system clipboard out of the test.
         let board = NSPasteboard::pasteboardWithUniqueName();
         let mut clipboard = Clipboard::default();
-        let text = "café\n東京";
-        assert!(clipboard.write_board(&board, text));
+        let text = Clip::text("café\n東京");
+        assert!(clipboard.write_board(&board, &text, false));
         assert_eq!(clipboard.observed, Some(board.changeCount()));
         assert_eq!(
             clipboard.read_board(&board, board.changeCount()),
-            Ok(text.into())
+            Ok(text.clone())
         );
 
-        assert!(clipboard.write_board(&board, &"a".repeat(MAX_CLIP_BYTES + 1)));
+        assert!(clipboard.write_board(&board, &Clip::text("a".repeat(MAX_CLIP_BYTES + 1)), false));
         assert_eq!(
             clipboard.read_text(&board),
             Err("Clipboard text exceeds 64 KiB.")
@@ -117,7 +356,7 @@ mod tests {
         board.clearContents();
         // SAFETY: This exported AppKit constant is an immutable type identifier.
         assert!(
-            board.setString_forType(&NSString::from_str(text), unsafe { NSPasteboardTypeString })
+            board.setString_forType(&NSString::from_str("x"), unsafe { NSPasteboardTypeString })
         );
         assert_eq!(
             clipboard.read_board(&board, stale_count),
@@ -128,6 +367,58 @@ mod tests {
             clipboard.read_text(&board),
             Err("Clipboard item marked private, transient, or generated.")
         );
+        board.clearContents();
+    }
+
+    #[test]
+    #[ignore = "requires access to the macOS pasteboard service"]
+    fn formatted_text_and_images_round_trip() {
+        let board = NSPasteboard::pasteboardWithUniqueName();
+        let mut clipboard = Clipboard::default();
+
+        let formatted = Clip::Text(Text {
+            plain: "bold".into(),
+            rtf: Some(b"{\\rtf1\\ansi {\\b bold}}".as_slice().into()),
+            html: Some(b"<b>bold</b>".as_slice().into()),
+        });
+        assert!(clipboard.write_board(&board, &formatted, false));
+        assert_eq!(clipboard.read_text(&board), Ok(formatted.clone()));
+        // Plain restore drops the formats.
+        assert!(clipboard.write_board(&board, &formatted, true));
+        assert_eq!(clipboard.read_text(&board), Ok(Clip::text("bold")));
+
+        let png = synthetic_png();
+        let Ok(Clip::Image(image)) = image_clip(png.clone()) else {
+            panic!("image clip");
+        };
+        assert_eq!((image.width, image.height), (2, 1));
+        let thumbnail = image.thumbnail.clone().expect("thumbnail");
+        assert_eq!((thumbnail.width, thumbnail.height), (2, 1));
+        assert_eq!(&thumbnail.rgba[..4], &[200, 40, 10, 255]);
+
+        assert!(clipboard.write_board(&board, &Clip::Image(image.clone()), false));
+        // SAFETY: These exported AppKit constants are immutable type identifiers.
+        unsafe {
+            assert!(board.dataForType(NSPasteboardTypeTIFF).is_some());
+            assert_eq!(
+                board
+                    .dataForType(NSPasteboardTypePNG)
+                    .map(|data| data.to_vec()),
+                Some(png)
+            );
+        }
+        assert_eq!(clipboard.read_text(&board), Ok(Clip::Image(image)));
+
+        // TIFF-only images are converted to PNG.
+        board.clearContents();
+        let tiff = thumbnail_source(3, 2).TIFFRepresentation().expect("TIFF");
+        // SAFETY: This exported AppKit constant is an immutable type identifier.
+        assert!(board.setData_forType(Some(&tiff), unsafe { NSPasteboardTypeTIFF }));
+        let Ok(Clip::Image(converted)) = clipboard.read_text(&board) else {
+            panic!("converted image");
+        };
+        assert!(converted.png.starts_with(b"\x89PNG"));
+        assert_eq!((converted.width, converted.height), (3, 2));
         board.clearContents();
     }
 }

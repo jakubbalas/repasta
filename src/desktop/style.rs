@@ -208,6 +208,15 @@ pub fn ghost(c: Colors) -> impl Fn(&Theme, button::Status) -> button::Style {
     }
 }
 
+/// A color clip's swatch, outlined so light and dark colors stay visible.
+pub fn swatch(c: Colors, fill: Color) -> impl Fn(&Theme) -> container::Style {
+    move |_| container::Style {
+        background: Some(Background::Color(fill)),
+        border: border(c.outline, 7.0),
+        ..container::Style::default()
+    }
+}
+
 /// A rounded status pill; `active` uses the accent, otherwise a neutral outline.
 pub fn pill(c: Colors, active: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
     move |_, status| {

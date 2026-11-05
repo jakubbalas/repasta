@@ -1,4 +1,4 @@
-use repasta::{History, MAX_CLIP_BYTES};
+use repasta::{Clip, History, MAX_CLIP_BYTES};
 use std::io::{self, BufRead, Read, Write};
 use std::process::ExitCode;
 
@@ -35,7 +35,7 @@ fn search(query: &str, mut input: impl BufRead, mut output: impl Write) -> io::R
         history.capture(clip);
     }
 
-    for clip in history.search(query) {
+    for clip in history.search(query).filter_map(Clip::plain) {
         writeln!(output, "{clip:?}")?;
     }
     Ok(())
