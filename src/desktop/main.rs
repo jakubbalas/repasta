@@ -1,22 +1,27 @@
 #[cfg(target_os = "macos")]
 mod appearance;
+#[cfg(target_os = "macos")]
+mod keychain;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "macos")]
 mod menu_bar;
+mod settings;
 mod style;
 
 use iced::keyboard::{Event as KeyEvent, Key, Modifiers, key::Named};
 use iced::mouse::ScrollDelta;
 use iced::widget::{
-    Space, button, column, container, mouse_area, row, text, text::Wrapping, text_input,
+    Space, button, column, container, mouse_area, row, text, text::Wrapping, text_input, toggler,
 };
 use iced::{
     Alignment, Element, Event, Fill, Font, Point, Size, Subscription, Task, event, font, window,
 };
+use repasta::store::{FolderStore, Sealer, Store, StoreError};
 use repasta::{Capture, History, MAX_CLIP_BYTES};
+use std::path::{Path, PathBuf};
 
 const SEARCH_ID: &str = "clip-search";
 const WINDOW_SIZE: Size = Size::new(400.0, 660.0);
@@ -66,6 +71,25 @@ enum Message {
     RestoreSelected,
     Restore(usize),
     Clear,
+    OpenSettings,
+    CloseSettings,
+    /// Settings draft: keep history for this session only.
+    DraftSession,
+    /// Settings draft: save history to a folder.
+    DraftFolder,
+    DraftPath(String),
+    DraftEncrypted(bool),
+    #[cfg(target_os = "macos")]
+    ChooseFolder,
+    ApplyStorage,
+}
+
+/// Unapplied changes in the settings view.
+#[derive(Default)]
+struct Draft {
+    folder: bool,
+    path: String,
+    encrypted: bool,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -86,8 +110,15 @@ struct Palette {
     scroll: f32,
     /// Number of clip cards that fit in the window.
     visible: usize,
-    status: &'static str,
+    status: String,
     tone: Tone,
+    /// Where history lives, as chosen in settings.
+    storage: settings::Storage,
+    /// The open folder store; `None` for session-only history or when the
+    /// chosen folder is unavailable.
+    store: Option<FolderStore>,
+    settings_open: bool,
+    draft: Draft,
     pinned: bool,
     mode: iced::theme::Mode,
     colors: style::Colors,
@@ -105,13 +136,14 @@ struct Palette {
 impl Palette {
     fn boot() -> (Self, Task<Message>) {
         let mut palette = Self {
-            status: "Session-only history. Nothing is written to disk.",
             pinned: true,
             visible: visible_cards(WINDOW_SIZE.height),
             mode: iced::theme::Mode::Dark,
+            storage: settings::load(),
             ..Self::default()
         };
         palette.refresh_colors(true);
+        palette.attach_storage(false);
         (
             palette,
             Task::batch([
@@ -143,9 +175,84 @@ impl Palette {
         }
     }
 
-    fn say(&mut self, tone: Tone, status: &'static str) {
+    fn say(&mut self, tone: Tone, status: impl Into<String>) {
         self.tone = tone;
-        self.status = status;
+        self.status = status.into();
+    }
+
+    /// Opens the store for `self.storage` and merges its saved history behind
+    /// the current clips. Writes only when `save` is set or the folder needs
+    /// converting. On failure, history stays session-only and the file is left
+    /// untouched.
+    fn attach_storage(&mut self, save: bool) {
+        self.store = None;
+        let Some(folder) = self.storage.folder.clone() else {
+            self.say(
+                Tone::Neutral,
+                "Session-only history. Nothing is written to disk.",
+            );
+            return;
+        };
+        let result = open_store(&folder, self.storage.encrypted).and_then(|mut store| {
+            let saved = store.load()?;
+            self.history.extend_older(saved.iter().map(String::as_str));
+            if save || store.has_other_form() {
+                store.save(&self.history)?;
+            }
+            Ok((store, saved.len()))
+        });
+        match result {
+            Ok((store, count)) => {
+                let name = folder_name(&folder);
+                let form = if store.encrypted() {
+                    "encrypted"
+                } else {
+                    "readable"
+                };
+                self.store = Some(store);
+                self.reset_selection();
+                self.say(
+                    Tone::Good,
+                    match count {
+                        0 => format!("Saving to {name} ({form})."),
+                        1 => format!("Loaded 1 clip from {name} ({form})."),
+                        n => format!("Loaded {n} clips from {name} ({form})."),
+                    },
+                );
+            }
+            Err(error) => self.say(
+                Tone::Warn,
+                format!("{error} Keeping history for this session only."),
+            ),
+        }
+    }
+
+    /// Saves history after a change. On failure, keeps the session going and
+    /// stops writing until storage is applied again.
+    fn persist(&mut self) {
+        if let Some(store) = &mut self.store
+            && let Err(error) = store.save(&self.history)
+        {
+            self.store = None;
+            self.say(
+                Tone::Warn,
+                format!("{error} Saving is off until you apply storage again."),
+            );
+        }
+    }
+
+    fn open_settings(&mut self) {
+        self.draft = Draft {
+            folder: self.storage.folder.is_some(),
+            path: self
+                .storage
+                .folder
+                .as_deref()
+                .map(|folder| folder.display().to_string())
+                .unwrap_or_default(),
+            encrypted: self.storage.encrypted && settings::ENCRYPTION_AVAILABLE,
+        };
+        self.settings_open = true;
     }
 
     fn reset_selection(&mut self) {
@@ -163,6 +270,7 @@ impl Palette {
             Ok(Capture::Added | Capture::Refreshed) => {
                 self.reset_selection();
                 self.say(Tone::Good, "Text captured.");
+                self.persist();
             }
             Ok(Capture::Empty) => self.say(Tone::Warn, "Clipboard text is empty."),
             Ok(Capture::TooLarge) => self.say(Tone::Warn, "Clipboard text exceeds 64 KiB."),
@@ -273,6 +381,7 @@ impl Palette {
                 self.query = query;
                 self.reset_selection();
             }
+            Message::Escape if self.settings_open => self.settings_open = false,
             Message::Escape => {
                 self.query.clear();
                 self.reset_selection();
@@ -313,7 +422,53 @@ impl Palette {
                 self.reset_selection();
                 #[cfg(target_os = "macos")]
                 self.clipboard.reset_observation();
-                self.say(Tone::Neutral, "History cleared.");
+                match self.store.as_mut().map(|store| store.erase()) {
+                    None => self.say(Tone::Neutral, "History cleared."),
+                    Some(Ok(())) => {
+                        self.say(Tone::Neutral, "History cleared here and in the folder.")
+                    }
+                    Some(Err(error)) => self.say(Tone::Warn, format!("Cleared here. {error}")),
+                }
+            }
+            Message::OpenSettings => self.open_settings(),
+            Message::CloseSettings => self.settings_open = false,
+            Message::DraftSession => self.draft.folder = false,
+            Message::DraftFolder => self.draft.folder = true,
+            Message::DraftPath(path) => self.draft.path = path,
+            Message::DraftEncrypted(encrypted) => self.draft.encrypted = encrypted,
+            #[cfg(target_os = "macos")]
+            Message::ChooseFolder => {
+                let current = Some(PathBuf::from(&self.draft.path)).filter(|path| path.is_dir());
+                if let Some(folder) = settings::choose_folder(current.as_deref()) {
+                    self.draft.folder = true;
+                    self.draft.path = folder.display().to_string();
+                }
+            }
+            Message::ApplyStorage => {
+                let folder = PathBuf::from(self.draft.path.trim());
+                if self.draft.folder && !folder.is_absolute() {
+                    self.say(Tone::Warn, "Choose a folder, or enter its full path.");
+                    return Task::none();
+                }
+                let storage = settings::Storage {
+                    folder: self.draft.folder.then_some(folder),
+                    encrypted: self.draft.encrypted,
+                };
+                let leaving = self
+                    .store
+                    .as_ref()
+                    .filter(|_| storage.folder.is_none())
+                    .map(|store| folder_name(store.folder()));
+                self.storage = storage;
+                settings::save(&self.storage);
+                self.attach_storage(true);
+                if let Some(name) = leaving {
+                    self.say(
+                        Tone::Neutral,
+                        format!("Session-only history. The file in {name} was kept."),
+                    );
+                }
+                self.settings_open = false;
             }
         }
         Task::none()
@@ -393,6 +548,9 @@ impl Palette {
 
     fn view(&self) -> Element<'_, Message> {
         let count = self.match_count();
+        if self.settings_open {
+            return column![self.header(count), self.settings_view(), self.footer()].into();
+        }
         column![
             self.header(count),
             container(
@@ -439,9 +597,15 @@ impl Palette {
             .style(style::pill(self.colors, false))
             .into();
 
+        let place = match &self.store {
+            Some(store) if store.encrypted() => "encrypted folder",
+            Some(_) => "readable folder",
+            None if self.storage.folder.is_some() => "not saved",
+            None => "this session",
+        };
         let summary = match (count, self.query.is_empty()) {
-            (1, true) => "1 clip · this session".to_owned(),
-            (n, true) => format!("{n} clips · this session"),
+            (1, true) => format!("1 clip · {place}"),
+            (n, true) => format!("{n} clips · {place}"),
             (1, false) => "1 match".to_owned(),
             (n, false) => format!("{n} matches"),
         };
@@ -456,7 +620,16 @@ impl Palette {
                     .spacing(2),
                     Space::new().width(Fill),
                     capture_mode,
+                    button(text("⚙").size(15))
+                        .padding([2, 7])
+                        .style(style::ghost(self.colors))
+                        .on_press(if self.settings_open {
+                            Message::CloseSettings
+                        } else {
+                            Message::OpenSettings
+                        }),
                 ]
+                .spacing(6)
                 .align_y(Alignment::Center),
             )
             // Leave room for the macOS traffic lights above the title.
@@ -470,6 +643,102 @@ impl Palette {
         )
         .on_press(Message::DragWindow)
         .into()
+    }
+
+    fn settings_view(&self) -> Element<'_, Message> {
+        let choice = |selected: bool, title: &'static str, detail: &'static str, message| {
+            button(
+                column![
+                    text(title).size(14).font(BOLD).color(self.colors.text),
+                    text(detail).size(12).color(self.colors.muted),
+                ]
+                .spacing(3),
+            )
+            .width(Fill)
+            .padding([10, 12])
+            .style(style::clip_card(self.colors, selected))
+            .on_press(message)
+        };
+
+        let mut content = column![
+            text("History storage").size(15).font(BOLD),
+            choice(
+                !self.draft.folder,
+                "This session only",
+                "Kept in memory and forgotten when Repasta quits.",
+                Message::DraftSession,
+            ),
+            choice(
+                self.draft.folder,
+                "Save to a folder",
+                "Kept in a file in a folder you choose.",
+                Message::DraftFolder,
+            ),
+        ]
+        .spacing(10);
+
+        if self.draft.folder {
+            let path = text_input("/full/path/to/folder", &self.draft.path)
+                .on_input(Message::DraftPath)
+                .on_submit(Message::ApplyStorage)
+                .padding([8, 10])
+                .size(13)
+                .style(style::search(self.colors));
+            #[cfg(target_os = "macos")]
+            let path = row![
+                path,
+                button(text("Choose…").size(12).font(BOLD))
+                    .padding([7, 10])
+                    .style(style::pill(self.colors, false))
+                    .on_press(Message::ChooseFolder),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center);
+
+            let encrypt = toggler(self.draft.encrypted)
+                .label("Encrypt with a key in the Keychain")
+                .text_size(13)
+                .size(18)
+                .on_toggle_maybe(settings::ENCRYPTION_AVAILABLE.then_some(Message::DraftEncrypted));
+            let note = if !settings::ENCRYPTION_AVAILABLE {
+                text("Encryption is not available on this platform yet. Anything you copy, including passwords, is saved as readable text.")
+                    .color(self.colors.warning)
+            } else if self.draft.encrypted {
+                text("Only this Mac account can read the file. Files sealed here cannot be opened on another Mac.")
+                    .color(self.colors.muted)
+            } else {
+                text("Anything you copy, including passwords, is saved as readable text.")
+                    .color(self.colors.warning)
+            };
+            content = content.push(path).push(encrypt).push(note.size(12));
+        }
+
+        let buttons = row![
+            text("Existing files are kept when you switch.")
+                .size(11)
+                .color(self.colors.faint),
+            Space::new().width(Fill),
+            button(text("Cancel").size(12).font(BOLD))
+                .padding([6, 12])
+                .style(style::ghost(self.colors))
+                .on_press(Message::CloseSettings),
+            button(text("Apply").size(12).font(BOLD))
+                .padding([6, 14])
+                .style(style::pill(self.colors, true))
+                .on_press(Message::ApplyStorage),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center);
+
+        container(column![content, Space::new().height(Fill), buttons])
+            .padding(iced::Padding {
+                top: 4.0,
+                right: 16.0,
+                bottom: 14.0,
+                left: 16.0,
+            })
+            .height(Fill)
+            .into()
     }
 
     fn results(&self, count: usize) -> Element<'_, Message> {
@@ -631,7 +900,7 @@ impl Palette {
                 .spacing(2)
                 .align_y(Alignment::Center),
                 row![
-                    text(self.status).size(12).color(tone),
+                    text(&self.status).size(12).color(tone),
                     Space::new().width(Fill),
                     button(text("Quit").size(11))
                         .padding([2, 8])
@@ -652,6 +921,38 @@ impl Palette {
         .style(style::footer(self.colors))
         .into()
     }
+}
+
+/// Opens the store for a folder. A sealer is needed to encrypt, or to read
+/// encrypted history when switching the folder to readable.
+fn open_store(folder: &Path, encrypted: bool) -> Result<FolderStore, StoreError> {
+    let sealed = FolderStore::has_sealed_history(folder);
+    let sealer: Option<Box<dyn Sealer>> = if encrypted || sealed {
+        #[cfg(target_os = "macos")]
+        {
+            // Create a key only when no sealed history could need the old one.
+            Some(Box::new(keychain::KeychainSealer::open(!sealed)?))
+        }
+        #[cfg(target_os = "linux")]
+        {
+            return Err(if encrypted {
+                StoreError::EncryptionUnavailable
+            } else {
+                StoreError::Locked
+            });
+        }
+    } else {
+        None
+    };
+    Ok(FolderStore::new(folder, encrypted, sealer))
+}
+
+/// The folder's own name for status messages.
+fn folder_name(folder: &Path) -> String {
+    folder
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| folder.display().to_string())
 }
 
 fn visible_cards(height: f32) -> usize {

@@ -1,8 +1,10 @@
 use std::collections::VecDeque;
 
+pub mod store;
+
 pub const MAX_CLIP_BYTES: usize = 64 * 1024;
-const MAX_HISTORY_BYTES: usize = 8 * 1024 * 1024;
-const MAX_ITEMS: usize = 512;
+pub(crate) const MAX_HISTORY_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_ITEMS: usize = 512;
 
 /// In-memory UTF-8 history ordered from most to least recently captured.
 #[derive(Default)]
@@ -46,6 +48,28 @@ impl History {
         Capture::Added
     }
 
+    /// Every clip, newest first.
+    pub fn iter(&self) -> impl Iterator<Item = &str> {
+        self.clips.iter().map(String::as_str)
+    }
+
+    /// Adds saved clips, given newest first, behind the current ones.
+    /// Duplicates keep their current position; limits still apply.
+    pub fn extend_older<'a>(&mut self, clips: impl DoubleEndedIterator<Item = &'a str>) {
+        let current: Vec<String> = self.clips.drain(..).collect();
+        self.bytes = 0;
+        for clip in clips.rev() {
+            self.capture(clip);
+        }
+        for clip in current.iter().rev() {
+            self.capture(clip);
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.clips.is_empty()
+    }
+
     /// Searches by case-sensitive substring. An empty query lists all entries.
     pub fn search<'a>(&'a self, query: &'a str) -> impl Iterator<Item = &'a str> + 'a {
         self.clips
@@ -86,6 +110,19 @@ mod tests {
         assert_eq!(history.search("").count(), slots);
         assert!(history.search("0000").next().is_none());
         assert_eq!(history.bytes, MAX_HISTORY_BYTES);
+    }
+
+    #[test]
+    fn saved_clips_go_behind_the_session() {
+        let mut history = History::default();
+        history.capture("old shared");
+        history.capture("session");
+        history.extend_older(["saved new", "old shared", "saved old"].into_iter());
+        assert_eq!(
+            history.iter().collect::<Vec<_>>(),
+            ["session", "old shared", "saved new", "saved old"]
+        );
+        assert_eq!(history.bytes, 7 + 10 + 9 + 9);
     }
 
     #[test]
