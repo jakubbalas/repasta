@@ -1,0 +1,22 @@
+[package]
+name = "repasta"
+version = "0.1.0"
+edition = "2024"
+publish = false
+default-run = "repasta"
+
+[dependencies]
+iced = { version = "0.14", optional = true, default-features = false, features = ["tiny-skia", "tokio", "x11", "wayland"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6", optional = true }
+objc2-app-kit = { version = "0.3.2", optional = true, default-features = false, features = ["std", "NSApplication", "NSButton", "NSColor", "NSColorSpace", "NSControl", "NSEvent", "NSImage", "NSMenu", "NSMenuItem", "NSPasteboard", "NSResponder", "NSRunningApplication", "NSStatusBar", "NSStatusBarButton", "NSStatusItem", "NSView", "NSWindow", "objc2-core-foundation"] }
+objc2-foundation = { version = "0.3.2", optional = true, default-features = false, features = ["std", "NSArray", "NSData", "NSDistributedNotificationCenter", "NSEnumerator", "NSNotification", "NSString", "NSUserDefaults"] }
+
+[features]
+desktop = ["dep:iced", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation"]
+
+[[bin]]
+name = "repasta-desktop"
+path = "src/desktop/main.rs"
+required-features = ["desktop"]
