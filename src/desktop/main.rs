@@ -79,6 +79,8 @@ enum Message {
     DraftFolder,
     DraftPath(String),
     DraftEncrypted(bool),
+    /// Applies and saves the panel appearance at once.
+    SetAppearance(settings::Appearance),
     #[cfg(target_os = "macos")]
     ChooseFolder,
     ApplyStorage,
@@ -119,6 +121,7 @@ struct Palette {
     store: Option<FolderStore>,
     settings_open: bool,
     draft: Draft,
+    appearance: settings::Appearance,
     pinned: bool,
     mode: iced::theme::Mode,
     colors: style::Colors,
@@ -140,6 +143,7 @@ impl Palette {
             visible: visible_cards(WINDOW_SIZE.height),
             mode: iced::theme::Mode::Dark,
             storage: settings::load(),
+            appearance: settings::load_appearance(),
             ..Self::default()
         };
         palette.refresh_colors(true);
@@ -168,7 +172,13 @@ impl Palette {
         let accent = appearance::accent_color();
         #[cfg(target_os = "linux")]
         let accent = None;
-        let colors = style::Colors::new(self.mode, accent);
+        // `self.mode` is the system mode; the preference may override it.
+        let mode = match self.appearance {
+            settings::Appearance::System => self.mode,
+            settings::Appearance::Light => iced::theme::Mode::Light,
+            settings::Appearance::Dark => iced::theme::Mode::Dark,
+        };
+        let colors = style::Colors::new(mode, accent);
         if force || colors != self.colors {
             self.colors = colors;
             self.theme = Some(colors.theme());
@@ -431,6 +441,11 @@ impl Palette {
                 }
             }
             Message::OpenSettings => self.open_settings(),
+            Message::SetAppearance(appearance) => {
+                self.appearance = appearance;
+                settings::save_appearance(appearance);
+                self.refresh_colors(false);
+            }
             Message::CloseSettings => self.settings_open = false,
             Message::DraftSession => self.draft.folder = false,
             Message::DraftFolder => self.draft.folder = true,
@@ -660,7 +675,24 @@ impl Palette {
             .on_press(message)
         };
 
+        let appearance = Space::new().width(Fill);
+        let appearance = settings::Appearance::ALL.into_iter().fold(
+            row![text("Appearance").size(15).font(BOLD), appearance]
+                .spacing(6)
+                .align_y(Alignment::Center),
+            |row, choice| {
+                row.push(
+                    button(text(choice.label()).size(12).font(BOLD))
+                        .padding([5, 12])
+                        .style(style::pill(self.colors, choice == self.appearance))
+                        .on_press(Message::SetAppearance(choice)),
+                )
+            },
+        );
+
         let mut content = column![
+            appearance,
+            Space::new().height(6),
             text("History storage").size(15).font(BOLD),
             choice(
                 !self.draft.folder,

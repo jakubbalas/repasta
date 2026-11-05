@@ -33,10 +33,14 @@ folder; the system clipboard is separate.
   depends on the compositor permitting the clipboard transfer. Restore uses the
   Iced window clipboard.
 
-The panel follows the system Light or Dark appearance and switches when it
-changes. On macOS it also uses the accent color from **System Settings →
-Appearance** and updates as soon as you change it; with **Multicolor** it keeps
-Repasta's amber.
+By default the panel follows the system Light or Dark appearance and switches
+when it changes. To keep it light or dark regardless, click **⚙** and pick
+**Light** or **Dark** under **Appearance**; **System** follows the system
+again. The choice applies at once and is remembered.
+
+On macOS the panel also uses the accent color from **System Settings →
+Appearance** and updates as soon as you change it; with **Multicolor** it
+keeps Repasta's amber.
 
 Each clip is limited to 64 KiB, and history retains at most 512 clips and
 8 MiB of text payload.
