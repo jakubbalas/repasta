@@ -248,6 +248,21 @@ impl History {
         }
     }
 
+    /// Removes the `nth` clip matching `query`, newest first, as listed by
+    /// [`History::search`].
+    pub fn remove_match(&mut self, query: &str, nth: usize) -> Option<Clip> {
+        let index = self
+            .clips
+            .iter()
+            .enumerate()
+            .filter(|(_, clip)| clip.matches(query))
+            .nth(nth)?
+            .0;
+        let clip = self.clips.remove(index)?;
+        self.uncount(&clip);
+        Some(clip)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.clips.is_empty()
     }
@@ -319,6 +334,20 @@ mod tests {
             ["session", "old shared", "saved new", "saved old"]
         );
         assert_eq!(history.text_bytes, 7 + 10 + 9 + 9);
+    }
+
+    #[test]
+    fn remove_match_counts_only_matching_clips() {
+        let mut history = History::default();
+        for clip in ["apple", "banana", "apricot", "cherry"] {
+            history.capture(clip);
+        }
+        history.add(image(7, 10));
+        assert_eq!(history.remove_match("ap", 1), Some(Clip::text("apple")));
+        assert_eq!(history.remove_match("ap", 1), None);
+        assert_eq!(history.remove_match("", 0), Some(image(7, 10)));
+        assert_eq!(texts(history.iter()), ["cherry", "apricot", "banana"]);
+        assert_eq!((history.text_bytes, history.image_bytes), (19, 0));
     }
 
     #[test]

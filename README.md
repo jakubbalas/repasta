@@ -15,9 +15,10 @@ windows. Click **Pinned** to let it sit behind other windows instead. Click
 **↓** or scroll to select, and press **Enter**, **⌘1**–**⌘9**, or click a clip
 to put it on the system clipboard. Hold **Shift** (**⇧⏎**, **⌘⇧1**–**⌘⇧9**,
 or Shift-click) to copy formatted text as plain text. On Linux, use **Ctrl** instead of **⌘**. Then
-paste in the destination app as usual. **Esc** clears the search. **Clear**
-clears Repasta's history, including the saved file when history is saved to a
-folder; the system clipboard is separate.
+paste in the destination app as usual. **Esc** clears the search. Click **×** on a
+clip to delete just that clip. **Clear** clears Repasta's history; when history
+is saved to a folder, it asks first and also deletes the saved file. The system
+clipboard is separate.
 
 - **macOS:** Repasta runs from the menu bar and has no Dock icon. Closing the
   window or pressing **⌘W** hides the panel and keeps Repasta running, including

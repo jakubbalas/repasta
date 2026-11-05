@@ -75,7 +75,12 @@ enum Message {
     Resized(Size),
     RestoreSelected,
     Restore(usize),
+    /// Deletes one clip, by its position in the current results.
+    Delete(usize),
+    /// Clears history, asking first when it is saved to a folder.
     Clear,
+    ConfirmClear,
+    CancelClear,
     OpenSettings,
     CloseSettings,
     /// Settings draft: keep history for this session only.
@@ -142,6 +147,8 @@ struct Palette {
     save_again: bool,
     modifiers: Modifiers,
     settings_open: bool,
+    /// Clear is waiting for confirmation.
+    confirm_clear: bool,
     draft: Draft,
     appearance: settings::Appearance,
     pinned: bool,
@@ -446,6 +453,7 @@ impl Palette {
                 self.query = query;
                 self.reset_selection();
             }
+            Message::Escape if self.confirm_clear => self.confirm_clear = false,
             Message::Escape if self.settings_open => self.settings_open = false,
             Message::Escape => {
                 self.query.clear();
@@ -481,7 +489,11 @@ impl Palette {
                 }
                 return self.restore(index);
             }
-            Message::Clear => {
+            Message::Delete(index) => return self.delete(index),
+            Message::Clear if self.store.is_some() => self.confirm_clear = true,
+            Message::CancelClear => self.confirm_clear = false,
+            Message::Clear | Message::ConfirmClear => {
+                self.confirm_clear = false;
                 self.history = History::default();
                 self.query.clear();
                 self.reset_selection();
@@ -590,6 +602,28 @@ impl Palette {
     }
 
     /// Puts a clip on the system clipboard. Holding Shift drops formatting.
+    fn delete(&mut self, index: usize) -> Task<Message> {
+        if self.history.remove_match(&self.query, index).is_none() {
+            return Task::none();
+        }
+        let count = self.match_count();
+        self.selected = self.selected.min(count.saturating_sub(1));
+        // Pull later cards up instead of leaving a gap at the end.
+        self.offset = self
+            .offset
+            .min(self.selected)
+            .min(count.saturating_sub(self.visible));
+        self.say(
+            Tone::Neutral,
+            if self.store.is_some() {
+                "Clip deleted here and in the folder."
+            } else {
+                "Clip deleted."
+            },
+        );
+        self.persist()
+    }
+
     fn restore(&mut self, index: usize) -> Task<Message> {
         let Some(clip) = self.history.search(&self.query).nth(index).cloned() else {
             return Task::none();
@@ -977,6 +1011,12 @@ impl Palette {
             Space::new().into()
         };
 
+        let delete = button(text("×").size(14).line_height(1.0))
+            .padding([1, 6])
+            .style(style::ghost(self.colors))
+            .on_press(Message::Delete(index));
+        let hint = row![hint, delete].spacing(6).align_y(Alignment::Center);
+
         let content: Element<'a, Message> = match clip {
             Clip::Text(clip_text) => {
                 let card = Preview::of(&clip_text.plain);
@@ -1101,24 +1141,52 @@ impl Palette {
             Tone::Warn => self.colors.warning,
         };
 
+        let actions: Element<'_, Message> = if self.confirm_clear {
+            let folder = self
+                .storage
+                .folder
+                .as_deref()
+                .map(folder_name)
+                .unwrap_or_default();
+            row![
+                text(format!(
+                    "Delete every clip, including the file in {folder}?"
+                ))
+                .size(12)
+                .color(self.colors.warning)
+                .width(Fill),
+                action("Cancel", Message::CancelClear),
+                button(text("Clear all").size(12).font(BOLD))
+                    .padding([5, 9])
+                    .style(button::danger)
+                    .on_press(Message::ConfirmClear),
+            ]
+            .spacing(4)
+            .align_y(Alignment::Center)
+            .into()
+        } else {
+            row![
+                action("Capture", Message::Capture),
+                action("Clear", Message::Clear),
+                button(
+                    text(if self.pinned { "Pinned" } else { "Pin" })
+                        .size(12)
+                        .font(BOLD)
+                )
+                .padding([5, 9])
+                .style(style::ghost(self.colors))
+                .on_press(Message::TogglePin),
+                Space::new().width(Fill),
+                keys,
+            ]
+            .spacing(2)
+            .align_y(Alignment::Center)
+            .into()
+        };
+
         container(
             column![
-                row![
-                    action("Capture", Message::Capture),
-                    action("Clear", Message::Clear),
-                    button(
-                        text(if self.pinned { "Pinned" } else { "Pin" })
-                            .size(12)
-                            .font(BOLD)
-                    )
-                    .padding([5, 9])
-                    .style(style::ghost(self.colors))
-                    .on_press(Message::TogglePin),
-                    Space::new().width(Fill),
-                    keys,
-                ]
-                .spacing(2)
-                .align_y(Alignment::Center),
+                actions,
                 row![
                     text(&self.status).size(12).color(tone),
                     Space::new().width(Fill),
