@@ -59,52 +59,13 @@ impl Appearance {
     }
 }
 
-/// The global shortcut that shows or hides the panel.
-#[cfg(target_os = "macos")]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Shortcut {
-    Off,
-    /// ⇧⌘V. Some apps use it to paste without formatting.
-    #[default]
-    ShiftCommandV,
-    /// ⌃⌘V. Rarely used by other apps.
-    ControlCommandV,
-}
-
-#[cfg(target_os = "macos")]
-impl Shortcut {
-    pub const ALL: [Self; 3] = [Self::ShiftCommandV, Self::ControlCommandV, Self::Off];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Off => "Off",
-            Self::ShiftCommandV => "⇧⌘V",
-            Self::ControlCommandV => "⌃⌘V",
-        }
-    }
-
-    fn key(self) -> &'static str {
-        match self {
-            Self::Off => "off",
-            Self::ShiftCommandV => "shift-command-v",
-            Self::ControlCommandV => "control-command-v",
-        }
-    }
-
-    fn from_key(key: &str) -> Self {
-        Self::ALL
-            .into_iter()
-            .find(|shortcut| shortcut.key() == key)
-            .unwrap_or_default()
-    }
-}
-
 /// Whether this platform has a key storage adapter.
 pub const ENCRYPTION_AVAILABLE: bool = cfg!(target_os = "macos");
 
 #[cfg(target_os = "macos")]
 mod platform {
-    use super::{Appearance, Shortcut, Storage};
+    use super::{Appearance, Storage};
+    use crate::hotkey::Shortcut;
     use objc2::MainThreadMarker;
     use objc2_app_kit::{NSModalPanelWindowLevel, NSModalResponseOK, NSOpenPanel};
     use objc2_foundation::{NSString, NSURL, NSUserDefaults};
@@ -115,19 +76,30 @@ mod platform {
     const APPEARANCE: &str = "Appearance";
     const SHORTCUT: &str = "Shortcut";
 
-    pub fn load_shortcut() -> Shortcut {
-        NSUserDefaults::standardUserDefaults()
-            .stringForKey(&NSString::from_str(SHORTCUT))
-            .map(|key| Shortcut::from_key(&key.to_string()))
-            .unwrap_or_default()
+    const SHORTCUT_OFF: &str = "off";
+
+    /// The global shortcut, or `None` when it's off. Defaults to ⌃⌘V, which
+    /// other apps rarely use, and also when the saved value is unreadable.
+    pub fn load_shortcut() -> Option<Shortcut> {
+        let Some(name) =
+            NSUserDefaults::standardUserDefaults().stringForKey(&NSString::from_str(SHORTCUT))
+        else {
+            return Some(Shortcut::CONTROL_COMMAND_V);
+        };
+        let name = name.to_string();
+        if name == SHORTCUT_OFF {
+            return None;
+        }
+        Some(Shortcut::parse(&name).unwrap_or(Shortcut::CONTROL_COMMAND_V))
     }
 
-    pub fn save_shortcut(shortcut: Shortcut) {
+    pub fn save_shortcut(shortcut: Option<Shortcut>) {
+        let name = shortcut.map_or_else(|| SHORTCUT_OFF.to_owned(), Shortcut::name);
         let defaults = NSUserDefaults::standardUserDefaults();
         // SAFETY: An NSString is a valid property list value.
         unsafe {
             defaults.setObject_forKey(
-                Some(&NSString::from_str(shortcut.key())),
+                Some(&NSString::from_str(&name)),
                 &NSString::from_str(SHORTCUT),
             );
         }

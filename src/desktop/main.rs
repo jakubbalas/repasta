@@ -95,7 +95,16 @@ enum Message {
     SetAppearance(settings::Appearance),
     /// Registers and saves the global shortcut at once.
     #[cfg(target_os = "macos")]
-    SetShortcut(settings::Shortcut),
+    SetShortcut(Option<hotkey::Shortcut>),
+    /// Waits for the next key press to use as the global shortcut.
+    #[cfg(target_os = "macos")]
+    CaptureShortcut,
+    /// A key press while capturing a shortcut.
+    #[cfg(target_os = "macos")]
+    CapturedKey(iced::keyboard::key::Physical, Modifiers),
+    /// Stops capturing and keeps the current shortcut.
+    #[cfg(target_os = "macos")]
+    CancelCapture,
     /// The global shortcut was pressed.
     #[cfg(target_os = "macos")]
     ShortcutPressed,
@@ -167,8 +176,12 @@ struct Palette {
     clipboard: macos::Clipboard,
     #[cfg(target_os = "macos")]
     menu_bar: Option<menu_bar::MenuBar>,
+    /// The global shortcut; `None` when it's off.
     #[cfg(target_os = "macos")]
-    shortcut: settings::Shortcut,
+    shortcut: Option<hotkey::Shortcut>,
+    /// Whether the next key press becomes the global shortcut.
+    #[cfg(target_os = "macos")]
+    capturing_shortcut: bool,
     /// The registered global shortcut; dropping it unregisters.
     #[cfg(target_os = "macos")]
     hotkey: Option<hotkey::HotKey>,
@@ -432,18 +445,57 @@ impl Palette {
             }
             #[cfg(target_os = "macos")]
             Message::SetShortcut(shortcut) => {
+                self.capturing_shortcut = false;
                 self.shortcut = shortcut;
                 settings::save_shortcut(shortcut);
                 if self.register_shortcut() {
                     self.say(
                         Tone::Neutral,
                         match shortcut {
-                            settings::Shortcut::Off => "Global shortcut off.".to_owned(),
-                            shortcut => {
+                            None => "Global shortcut off.".to_owned(),
+                            Some(shortcut) => {
                                 format!("Press {} anywhere to show Repasta.", shortcut.label())
                             }
                         },
                     );
+                }
+            }
+            #[cfg(target_os = "macos")]
+            Message::CaptureShortcut => {
+                self.capturing_shortcut = true;
+                // Let the current shortcut reach the panel so it can be chosen again.
+                self.hotkey = None;
+                self.say(Tone::Neutral, "Press the new shortcut. Esc cancels.");
+            }
+            #[cfg(target_os = "macos")]
+            Message::CapturedKey(key, modifiers) => {
+                use iced::keyboard::key::{Code, Physical};
+                match key {
+                    Physical::Code(Code::Escape) => return self.update(Message::CancelCapture),
+                    // Wait for the key that goes with the modifiers.
+                    Physical::Code(
+                        Code::ShiftLeft
+                        | Code::ShiftRight
+                        | Code::ControlLeft
+                        | Code::ControlRight
+                        | Code::AltLeft
+                        | Code::AltRight
+                        | Code::SuperLeft
+                        | Code::SuperRight
+                        | Code::Meta
+                        | Code::Fn
+                        | Code::CapsLock,
+                    ) => {}
+                    key => match hotkey::Shortcut::from_press(&key, modifiers) {
+                        Ok(shortcut) => return self.update(Message::SetShortcut(Some(shortcut))),
+                        Err(reason) => self.say(Tone::Warn, reason),
+                    },
+                }
+            }
+            #[cfg(target_os = "macos")]
+            Message::CancelCapture => {
+                if self.cancel_capture() {
+                    self.say(Tone::Neutral, "Shortcut unchanged.");
                 }
             }
             #[cfg(target_os = "macos")]
@@ -561,7 +613,11 @@ impl Palette {
                 settings::save_appearance(appearance);
                 self.refresh_colors(false);
             }
-            Message::CloseSettings => self.settings_open = false,
+            Message::CloseSettings => {
+                #[cfg(target_os = "macos")]
+                self.cancel_capture();
+                self.settings_open = false;
+            }
             Message::DraftSession => self.draft.folder = false,
             Message::DraftFolder => self.draft.folder = true,
             Message::DraftPath(path) => self.draft.path = path,
@@ -603,6 +659,8 @@ impl Palette {
                         format!("Session-only history. The file in {name} was kept."),
                     );
                 }
+                #[cfg(target_os = "macos")]
+                self.cancel_capture();
                 self.settings_open = false;
                 #[cfg(target_os = "macos")]
                 return Task::done(Message::MakeThumbnails);
@@ -654,16 +712,31 @@ impl Palette {
     fn register_shortcut(&mut self) -> bool {
         // Unregister first so re-registering the same shortcut succeeds.
         self.hotkey = None;
-        match hotkey::HotKey::register(self.shortcut) {
+        let Some(shortcut) = self.shortcut else {
+            return true;
+        };
+        match hotkey::HotKey::register(shortcut) {
             Ok(hotkey) => {
-                self.hotkey = hotkey;
+                self.hotkey = Some(hotkey);
                 true
             }
             Err(error) => {
-                self.say(Tone::Warn, format!("{} {error}", self.shortcut.label()));
+                self.say(Tone::Warn, format!("{} {error}", shortcut.label()));
                 false
             }
         }
+    }
+
+    /// Stops capturing a shortcut and restores the current one. Returns
+    /// whether a capture was running.
+    #[cfg(target_os = "macos")]
+    fn cancel_capture(&mut self) -> bool {
+        if !self.capturing_shortcut {
+            return false;
+        }
+        self.capturing_shortcut = false;
+        self.register_shortcut();
+        true
     }
 
     fn delete(&mut self, index: usize) -> Task<Message> {
@@ -726,7 +799,39 @@ impl Palette {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        let keyboard = event::listen_with(|event, _, _| match event {
+        // While capturing a shortcut, every key press goes to the capture.
+        #[cfg(target_os = "macos")]
+        let keys = if self.capturing_shortcut {
+            Self::capture_keys()
+        } else {
+            Self::panel_keys()
+        };
+        #[cfg(not(target_os = "macos"))]
+        let keys = Self::panel_keys();
+        let keyboard = Subscription::batch([
+            keys,
+            window::resize_events().map(|(_, size)| Message::Resized(size)),
+            window::close_requests().map(|_| Message::Hide),
+            #[cfg(target_os = "linux")]
+            iced::system::theme_changes().map(Message::SystemTheme),
+            #[cfg(target_os = "macos")]
+            Subscription::run(appearance::changes).map(|()| Message::AppearanceChanged),
+            #[cfg(target_os = "macos")]
+            Subscription::run(hotkey::presses).map(|()| Message::ShortcutPressed),
+        ]);
+        #[cfg(target_os = "macos")]
+        if self.recording {
+            return Subscription::batch([
+                keyboard,
+                iced::time::every(std::time::Duration::from_millis(200)).map(|_| Message::Poll),
+            ]);
+        }
+        keyboard
+    }
+
+    /// The panel's own keys: selection, Escape, ⌘1–⌘9, ⌘Q, and ⌘W.
+    fn panel_keys() -> Subscription<Message> {
+        event::listen_with(|event, _, _| match event {
             Event::Keyboard(KeyEvent::KeyPressed {
                 key: Key::Named(key),
                 modifiers,
@@ -759,26 +864,23 @@ impl Palette {
             }
             Event::Window(window::Event::Focused) => Some(Message::AppearanceChanged),
             _ => None,
-        });
-        let keyboard = Subscription::batch([
-            keyboard,
-            window::resize_events().map(|(_, size)| Message::Resized(size)),
-            window::close_requests().map(|_| Message::Hide),
-            #[cfg(target_os = "linux")]
-            iced::system::theme_changes().map(Message::SystemTheme),
-            #[cfg(target_os = "macos")]
-            Subscription::run(appearance::changes).map(|()| Message::AppearanceChanged),
-            #[cfg(target_os = "macos")]
-            Subscription::run(hotkey::presses).map(|()| Message::ShortcutPressed),
-        ]);
-        #[cfg(target_os = "macos")]
-        if self.recording {
-            return Subscription::batch([
-                keyboard,
-                iced::time::every(std::time::Duration::from_millis(200)).map(|_| Message::Poll),
-            ]);
-        }
-        keyboard
+        })
+    }
+
+    /// Every key press, for choosing a new global shortcut. Leaving the
+    /// panel cancels, so the old shortcut is never left unregistered.
+    #[cfg(target_os = "macos")]
+    fn capture_keys() -> Subscription<Message> {
+        event::listen_with(|event, _, _| match event {
+            Event::Keyboard(KeyEvent::KeyPressed {
+                physical_key,
+                modifiers,
+                repeat: false,
+                ..
+            }) => Some(Message::CapturedKey(physical_key, modifiers)),
+            Event::Window(window::Event::Unfocused) => Some(Message::CancelCapture),
+            _ => None,
+        })
     }
 
     fn view(&self) -> Element<'_, Message> {
@@ -913,30 +1015,62 @@ impl Palette {
 
         #[cfg(target_os = "macos")]
         let shortcut: Element<'_, Message> = {
-            let pills = settings::Shortcut::ALL.into_iter().fold(
-                row![
-                    text("Shortcut").size(15).font(BOLD),
-                    Space::new().width(Fill)
-                ]
-                .spacing(6)
-                .align_y(Alignment::Center),
-                |row, choice| {
-                    row.push(
-                        button(text(choice.label()).size(12).font(BOLD))
-                            .padding([5, 12])
-                            .style(style::pill(self.colors, choice == self.shortcut))
-                            .on_press(Message::SetShortcut(choice)),
-                    )
-                },
-            );
+            let pill = |label: String, active: bool, message: Message| {
+                button(text(label).size(12).font(BOLD))
+                    .padding([5, 12])
+                    .style(style::pill(self.colors, active))
+                    .on_press(message)
+            };
+            let capturing = self.capturing_shortcut;
+            let mut pills = row![
+                text("Shortcut").size(15).font(BOLD),
+                Space::new().width(Fill)
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center);
+            for preset in hotkey::Shortcut::PRESETS {
+                pills = pills.push(pill(
+                    preset.label(),
+                    !capturing && self.shortcut == Some(preset),
+                    Message::SetShortcut(Some(preset)),
+                ));
+            }
+            let custom = self
+                .shortcut
+                .filter(|shortcut| !hotkey::Shortcut::PRESETS.contains(shortcut));
+            pills = pills.push(if capturing {
+                pill("Press keys…".to_owned(), true, Message::CancelCapture)
+            } else if let Some(custom) = custom {
+                pill(custom.label(), true, Message::CaptureShortcut)
+            } else {
+                pill("Record…".to_owned(), false, Message::CaptureShortcut)
+            });
+            pills = pills.push(pill(
+                "Off".to_owned(),
+                !capturing && self.shortcut.is_none(),
+                Message::SetShortcut(None),
+            ));
+
             let note = match self.shortcut {
-                settings::Shortcut::Off => "Use the menu bar icon to show Repasta.",
-                settings::Shortcut::ShiftCommandV => {
-                    "Shows or hides Repasta from any app. Some apps use ⇧⌘V to paste without formatting; Repasta takes it while running."
+                _ if capturing => "Press the keys for the new shortcut, holding ⌘, ⌃, or ⌥. \
+                     Esc cancels."
+                    .to_owned(),
+                None => "Use the menu bar icon to show Repasta.".to_owned(),
+                Some(hotkey::Shortcut::SHIFT_COMMAND_V) => {
+                    "Shows or hides Repasta from any app. Many apps use ⇧⌘V to paste and \
+                     match style; Repasta takes it from them while it runs."
+                        .to_owned()
                 }
-                settings::Shortcut::ControlCommandV => {
-                    "Shows or hides Repasta from any app. Rarely used by other apps."
+                Some(hotkey::Shortcut::CONTROL_COMMAND_V) => {
+                    "Shows or hides Repasta from any app. Other apps rarely use ⌃⌘V. \
+                     Click Record… to choose your own."
+                        .to_owned()
                 }
+                Some(custom) => format!(
+                    "Shows or hides Repasta from any app. If another app uses {}, Repasta \
+                     takes it while it runs. Click it to record another.",
+                    custom.label()
+                ),
             };
             column![pills, text(note).size(12).color(self.colors.muted)]
                 .spacing(6)

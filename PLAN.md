@@ -50,9 +50,11 @@ state, data lifetime, and platform limitations visible.
 - **macOS.** Prototype AppKit general pasteboard capture with polling gated by
   `NSPasteboard.changeCount`. Measure polling latency and idle wakeups.
   Treat clipboard restore, shortcuts, and direct insertion as separate
-  capabilities. The global shortcut (⇧⌘V by default, ⌃⌘V, or off) is a
-  Carbon `RegisterEventHotKey` registration, which needs no Accessibility or
-  Input Monitoring permission and reports only its own key. Direct insertion
+  capabilities. The global shortcut (⌃⌘V by default, ⇧⌘V, a recorded
+  key combination, or off) is a Carbon `RegisterEventHotKey` registration,
+  which needs no Accessibility or Input Monitoring permission and reports only
+  its own key. ⇧⌘V is not the default because many apps use it for Paste and
+  Match Style. Direct insertion
   would need Accessibility and stays a separate, opt-in step. [AppKit change count](https://developer.apple.com/documentation/appkit/nspasteboard/changecount)
 - **Linux Wayland.** Probe the compositor for a supported data-control
   protocol. Provide a focused manual capture workflow when background capture

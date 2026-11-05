@@ -6,7 +6,7 @@
 
 <p align="center">
   <strong>A fast, private clipboard history that lives in your menu bar.</strong><br>
-  Copy as usual, press <kbd>⇧</kbd><kbd>⌘</kbd><kbd>V</kbd>, find it, paste it again.
+  Copy as usual, press <kbd>⌃</kbd><kbd>⌘</kbd><kbd>V</kbd>, find it, paste it again.
 </p>
 
 <p align="center">
@@ -27,7 +27,8 @@
 
 ## Highlights
 
-- **⌨️ Keyboard first.** Open it from any app with <kbd>⇧</kbd><kbd>⌘</kbd><kbd>V</kbd>, type to search,
+- **⌨️ Keyboard first.** Open it from any app with <kbd>⌃</kbd><kbd>⌘</kbd><kbd>V</kbd> (or a shortcut you
+  record), type to search,
   <kbd>↑</kbd> <kbd>↓</kbd> to pick, <kbd>⏎</kbd> to copy. <kbd>⌘1</kbd>–<kbd>⌘9</kbd> grab a clip directly.
 - **🖼️ More than text.** Screenshots and images with a preview, formatted text
   that keeps its bold and links, and smart cards for links and colors.
@@ -78,13 +79,13 @@ make run
 1. Click **Paused** to start **Recording**. The menu bar icon fills in while
    Repasta collects new copies. On Linux, click **Capture** to save the current
    clip.
-2. Press <kbd>⇧</kbd><kbd>⌘</kbd><kbd>V</kbd> anywhere to open the panel with an empty search.
+2. Press <kbd>⌃</kbd><kbd>⌘</kbd><kbd>V</kbd> anywhere to open the panel with an empty search.
 3. Type to filter, pick a clip, and press <kbd>⏎</kbd>. It's now on the clipboard;
    paste with <kbd>⌘</kbd><kbd>V</kbd>.
 
 | Keys | Action |
 | --- | --- |
-| <kbd>⇧</kbd><kbd>⌘</kbd><kbd>V</kbd> | Show or hide Repasta from any app (macOS) |
+| <kbd>⌃</kbd><kbd>⌘</kbd><kbd>V</kbd> | Show or hide Repasta from any app (macOS; change it in settings) |
 | Type | Search clips (case-sensitive); type `image` to find images |
 | <kbd>↑</kbd> <kbd>↓</kbd> or scroll | Select a clip |
 | <kbd>⏎</kbd> or click | Copy the selected clip |
@@ -131,9 +132,11 @@ Click **⚙** in the panel.
 - **Appearance:** **System** (default) follows Light and Dark mode as it
   changes; **Light** or **Dark** keeps one. The panel also follows your accent
   color, and keeps Repasta's amber with **Multicolor**.
-- **Shortcut:** **⇧⌘V** (default), **⌃⌘V**, or **Off**. Some apps use ⇧⌘V to
-  paste without formatting, so Repasta takes it from them while it runs. The
-  shortcut needs no Accessibility permission.
+- **Shortcut:** **⌃⌘V** (default), **⇧⌘V**, one you record, or **Off**. Click
+  **Record…** and press the keys you want, holding ⌘, ⌃, or ⌥ (function keys
+  work on their own); <kbd>Esc</kbd> cancels. While Repasta runs, its shortcut
+  wins over the same keys in other apps, so ⇧⌘V would replace **Paste and Match
+  Style**. The shortcut needs no Accessibility permission.
 - **History storage:** choose, then click **Apply**.
   - **This session only** (default): clips live in memory and are forgotten
     when Repasta quits.
